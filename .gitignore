@@ -1,0 +1,6 @@
+*
+!src/
+!src/**
+!shfiles/
+!shfiles/**
+!.gitignore
