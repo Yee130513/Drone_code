@@ -60,8 +60,14 @@ namespace ego_planner
     int waypoint_num_, wp_id_;
     double planning_horizen_, planning_horizen_time_;
     double emergency_time_;
+    double emergency_hold_time_{1.0};
+    double replan_fail_retry_interval_{0.5};
+    ros::Time last_emergency_time_;
+    ros::Time last_plan_fail_time_;
+    int max_replan_failures_before_emergency_{3};
     bool flag_realworld_experiment_;
     bool enable_fail_safe_;
+    bool sticky_emergency_after_plan_fail_{true};
 
     /* planning data */
     //--------------

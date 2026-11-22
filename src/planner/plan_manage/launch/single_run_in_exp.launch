@@ -1,7 +1,25 @@
 <launch>
     <!-- number of moving objects -->
-    <arg name="obj_num" value="10" />
+    <arg name="obj_num" value="0" />
     <arg name="drone_id" value="0"/>
+
+    <!-- ========================================================= -->
+    <!-- Experiment switches                                        -->
+    <!-- ========================================================= -->
+
+    <!-- Planner front-end -->
+    <arg name="planner_type" value="SCA_ASTAR"/>
+
+    <!-- Planner-side time allocation.
+         必须保持 Global，作为 traj_server 执行层 EVTR 的安全下界。 -->
+    <arg name="planner_time_allocation_method" value="Global"/>
+
+    <!-- Backend dynamic safety threshold, default OFF for real flight -->
+    <arg name="enable_dynamic_clearance" value="false"/>
+
+    <!-- Execution-layer virtual time remapping, default OFF for first flight -->
+    <arg name="enable_exec_time_remap" value="false"/>
+    <arg name="exec_time_remap_mode" value="OFF"/>
 
     <arg name="map_size_x" value="13"/>
     <arg name="map_size_y" value="13"/>
@@ -16,6 +34,12 @@
         <arg name="map_size_z_" value="$(arg map_size_z)"/>
         <arg name="odometry_topic" value="$(arg odom_topic)"/>
         <arg name="obj_num_set" value="$(arg obj_num)" />
+
+         <!-- Planner-layer switches -->
+        <arg name="planner_type" value="$(arg planner_type)"/>
+        <arg name="planner_time_allocation_method" value="$(arg planner_time_allocation_method)"/>
+        <arg name="enable_dynamic_clearance" value="$(arg enable_dynamic_clearance)"/>
+
         <!-- camera pose: transform of camera frame in the world frame -->
         <!-- depth topic: depth image, 640x480 by default -->
         <!-- don't set cloud_topic if you already set these ones! -->
@@ -31,7 +55,7 @@
         <arg name="fy" value="384.39654541015625"/>
         <!-- maximum velocity and acceleration the drone will reach -->
         <arg name="max_vel" value="0.5" />
-        <arg name="max_acc" value="4.0" />
+        <arg name="max_acc" value="3.0" />
         <!--always set to 1.5 times grater than sensing horizen-->
         <arg name="planning_horizon" value="6" />
         <arg name="use_distinctive_trajs" value="false" />
@@ -62,5 +86,70 @@
         <!-- <remap from="position_cmd" to="/setpoints_cmd"/> -->
         <remap from="~planning/bspline" to="drone_$(arg drone_id)_planning/bspline"/>
         <param name="traj_server/time_forward" value="1.0" type="double"/>
+
+        <!-- ===================================================== -->
+        <!-- Execution-layer Virtual Time Re-mapping, EVTR          -->
+        <!-- 只改变 traj_server 沿 B-spline 采样的速度，不改变空间轨迹 -->
+        <!-- ===================================================== -->
+
+        <param name="traj_server/enable_virtual_time_remap"
+               value="$(arg enable_exec_time_remap)"
+               type="bool"/>
+
+        <param name="traj_server/time_remap_mode"
+               value="$(arg exec_time_remap_mode)"
+               type="string"/>
+
+        <!-- 动力学限制：traj_server 私有参数，不能指望读取 ego_planner_node 里的 manager/max_vel -->
+        <param name="traj_server/max_vel" value="$(arg max_vel)" type="double"/>
+        <param name="traj_server/max_acc" value="$(arg max_acc)" type="double"/>
+
+        <!-- α 上下界：首飞保守，仿真稳定后再放宽 -->
+        <param name="traj_server/alpha_min" value="0.40" type="double"/>
+        <param name="traj_server/alpha_max" value="1.50" type="double"/>
+
+        <!-- α 变化率限制，单位 1/s；下降可快，上升必须慢 -->
+        <param name="traj_server/alpha_rate_up" value="1.5" type="double"/>
+        <param name="traj_server/alpha_rate_down" value="4.0" type="double"/>
+
+        <!-- 前视窗口：提前看到急弯，避免当前直道末端过度加速 -->
+        <param name="traj_server/enable_lookahead_limit" value="true" type="bool"/>
+        <param name="traj_server/lookahead_time" value="0.60" type="double"/>
+        <param name="traj_server/lookahead_samples" value="6" type="int"/>
+        <param name="traj_server/dynamic_margin" value="0.90" type="double"/>
+
+        <!-- 链式求导加速度项：a = P'' alpha^2 + P' alpha_dot
+             首次测试可设 false，只启用 alpha_rate_limit；稳定后再设 true -->
+        <param name="traj_server/use_alpha_dot_acc" value="false" type="bool"/>
+
+        <!-- tracking error gate：实机建议开启，仿真调试可先关闭 -->
+        <param name="traj_server/enable_tracking_gate" value="false" type="bool"/>
+        <param name="traj_server/tracking_error_soft" value="0.20" type="double"/>
+        <param name="traj_server/tracking_error_hard" value="0.45" type="double"/>
+
+        <!-- 异常回退：回到原始时间推进 alpha = 1 -->
+        <param name="traj_server/enable_evtr_fallback" value="true" type="bool"/>
+        <param name="traj_server/fallback_to_global_on_error" value="true" type="bool"/>
+
+        <!-- dt 保护 -->
+        <param name="traj_server/max_timer_dt" value="0.05" type="double"/>
+        <param name="traj_server/default_timer_dt" value="0.01" type="double"/>
+
+        <!-- 日志 -->
+        <param name="traj_server/enable_evtr_log" value="true" type="bool"/>
+        <param name="traj_server/evtr_log_file" value="$(env HOME)/.ros/evtr_log.csv" type="string"/>
+        <param name="traj_server/evtr_debug" value="false" type="bool"/>
+
+        <!-- ===================================================== -->
+        <!-- Compatibility with old traj_server.cpp                 -->
+        <!-- 如果代码暂时还在读取 manager/time_scaling_method，保留这三行。
+             等 traj_server.cpp 改为读取 traj_server/enable_virtual_time_remap 后可以删除。 -->
+        <!-- ===================================================== -->
+        <param name="manager/max_vel" value="$(arg max_vel)" type="double"/>
+        <param name="manager/max_acc" value="$(arg max_acc)" type="double"/>
+        <param name="manager/time_scaling_method"
+               value="$(eval 'Elastic' if arg('enable_exec_time_remap') == 'true' else 'Global')"
+               type="string"/>
+               
     </node>
 </launch>

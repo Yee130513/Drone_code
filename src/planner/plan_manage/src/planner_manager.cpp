@@ -1,5 +1,7 @@
-// #include <fstream>
+﻿#include <cstdlib>
+#include <fstream>
 #include <plan_manage/planner_manager.h>
+#include <string>
 #include <thread>
 #include "visualization_msgs/Marker.h" // zx-todo
 
@@ -24,13 +26,13 @@ namespace ego_planner
     nh.param("manager/planning_horizon", pp_.planning_horizen_, 5.0);
     nh.param("manager/use_distinctive_trajs", pp_.use_distinctive_trajs, false);
     nh.param("manager/drone_id", pp_.drone_id, -1);
-    nh.param("manager/time_scaling_method", time_scaling_method_, std::string("Elastic"));
-    /* read algorithm parameters，参数读取 */
+    nh.param("manager/time_scaling_method", time_scaling_method_, std::string("Global"));
+    /* read algorithm parameters锛屽弬鏁拌鍙?*/
     nh.param("manager/max_vel", pp_.max_vel_, -1.0);
-    // ... 原有参数读取 ...
+    // ... 鍘熸湁鍙傛暟璇诲彇 ...
     nh.param("manager/drone_id", pp_.drone_id, -1);
 
-    // [新增] 读取消融实验的算法名称，默认为 "A_star"
+    // [鏂板] 璇诲彇娑堣瀺瀹為獙鐨勭畻娉曞悕绉帮紝榛樿涓?"A_star"
     nh.param("manager/planner_type", planner_type_, std::string("A_star"));
 
     local_data_.traj_id_ = 0;
@@ -228,8 +230,137 @@ namespace ego_planner
     Eigen::MatrixXd ctrl_pts, ctrl_pts_temp;
     UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
 
+    /* ================= ABLATION STUDY: DATA LOGGER ================= */
+    auto escape_csv = [](const std::string &s) -> std::string
+    {
+      std::string out = s;
+      for (char &c : out)
+      {
+        if (c == ',')
+        {
+          c = ';';
+        }
+      }
+      return out;
+    };
+
+    auto log_ablation_data = [&](bool optimization_success, double jerk_cost)
+    {
+      const char *home_env = std::getenv("HOME");
+      if (home_env == nullptr)
+      {
+        ROS_WARN_THROTTLE(1.0, "[DataLogger] HOME env is null, skip logging.");
+        return;
+      }
+
+      const std::string file_name = std::string(home_env) + "/.ros/sca_ablation.csv";
+
+      std::ofstream file(file_name, std::ios::out | std::ios::app);
+      if (!file.is_open())
+      {
+        ROS_WARN_THROTTLE(1.0, "[DataLogger] failed to open %s", file_name.c_str());
+        return;
+      }
+
+      file.seekp(0, std::ios::end);
+      if (file.tellp() == 0)
+      {
+        file << "Timestamp,"
+             << "Planner_Type,"
+             << "Init_Time_ms,"
+             << "Search_Time_ms,"
+             << "Optimization_Time_ms,"
+             << "Nodes_Expanded,"
+             << "Path_Length_m,"
+             << "Minimum_Clearance_m,"
+             << "Segment_Recheck_Fail_Count,"
+             << "Trajectory_Jerk_Cost,"
+             << "Optimization_Success,"
+             << "Opt_Iterations,"
+             << "AStar_Used_Fallback,"
+             << "AStar_Fallback_Reason,"
+             << "Guide_Path_Count,"
+             << "Guide_Invalid_Count,"
+             << "Init_Collision_Pts,"
+             << "Frontend_Failed,"
+             << "Frontend_Fail_Reason\n";
+      }
+
+      int nodes_expanded = -1;
+      double path_length_m = -1.0;
+      double search_time_ms = -1.0;
+      double minimum_clearance_m = -1.0;
+      int segment_recheck_fail_count = -1;
+      int astar_used_fallback = -1;
+      std::string astar_fallback_reason = "NA";
+
+      int opt_iterations = -1;
+      int guide_path_count = -1;
+      int guide_invalid_count = -1;
+      int init_collision_pts = -1;
+      int frontend_failed = -1;
+      std::string frontend_fail_reason = "NA";
+
+      if (bspline_optimizer_ != nullptr)
+      {
+        opt_iterations = bspline_optimizer_->getIterNum();
+        guide_path_count = bspline_optimizer_->getLastGuidePathCount();
+        guide_invalid_count = bspline_optimizer_->getLastGuideInvalidCount();
+        init_collision_pts = bspline_optimizer_->getInitCollisionPts();
+        frontend_failed = bspline_optimizer_->getLastFrontendFailed() ? 1 : 0;
+        frontend_fail_reason = bspline_optimizer_->getLastFrontendFailReason();
+
+        if (bspline_optimizer_->a_star_ != nullptr)
+        {
+          nodes_expanded = bspline_optimizer_->a_star_->getExpandedNodes();
+          path_length_m = bspline_optimizer_->a_star_->getPathLength();
+          search_time_ms = bspline_optimizer_->a_star_->getLastSearchTimeMs();
+          minimum_clearance_m = bspline_optimizer_->a_star_->getLastMinClearance();
+          segment_recheck_fail_count = bspline_optimizer_->a_star_->getSegmentCheckFailCount();
+          astar_used_fallback = bspline_optimizer_->a_star_->usedFallback() ? 1 : 0;
+          astar_fallback_reason = bspline_optimizer_->a_star_->getLastFallbackReason();
+        }
+      }
+
+      file << ros::Time::now().toSec() << ","
+           << escape_csv(planner_type_) << ","
+           << t_init.toSec() * 1000.0 << ","
+           << search_time_ms << ","
+           << t_opt.toSec() * 1000.0 << ","
+           << nodes_expanded << ","
+           << path_length_m << ","
+           << minimum_clearance_m << ","
+           << segment_recheck_fail_count << ","
+           << jerk_cost << ","
+           << (optimization_success ? 1 : 0) << ","
+           << opt_iterations << ","
+           << astar_used_fallback << ","
+           << escape_csv(astar_fallback_reason) << ","
+           << guide_path_count << ","
+           << guide_invalid_count << ","
+           << init_collision_pts << ","
+           << frontend_failed << ","
+           << escape_csv(frontend_fail_reason) << "\n";
+
+      file.close();
+    };
+    /* ============================================================== */
+
     vector<std::pair<int, int>> segments;
     segments = bspline_optimizer_->initControlPoints(ctrl_pts, true);
+
+    if (bspline_optimizer_->getLastFrontendFailed())
+    {
+      t_init = ros::Time::now() - t_start;
+      t_opt = ros::Duration(0.0);
+
+      ROS_ERROR_THROTTLE(0.5,
+                         "[PlannerManager] frontend guide failed before optimization. reason=%s",
+                         bspline_optimizer_->getLastFrontendFailReason().c_str());
+      continous_failures_count_++;
+      log_ablation_data(false, -1.0);
+      return false;
+    }
 
     t_init = ros::Time::now() - t_start;
     t_start = ros::Time::now();
@@ -286,53 +417,13 @@ namespace ego_planner
       visualization_->displayInitPathList(point_set, 0.2, 0);
     }
 
-    /* ================= ABLATION STUDY: DATA LOGGER ================= */
-   auto log_ablation_data = [&](bool is_success, double jerk_cost) {
-        std::string home_dir = getenv("HOME");
-        std::string file_name = home_dir + "/.ros/sca.csv";
-        
-        std::ofstream file(file_name, std::ios::out | std::ios::app);
-        if (file.is_open()) {
-            file.seekp(0, std::ios::end);
-            // 🚀 更新表头：加入了前端与耦合指标
-            if (file.tellp() == 0) {
-                file << "Timestamp,Planner_Type,Search_Time_ms,Opt_Time_ms,Opt_Iterations,Nodes_Expanded,Path_Length_m,Init_Collision_Pts,Is_Opt_Success,Traj_Jerk_Cost\n";
-            }
-            
-            // 安全获取前端数据 (防止 a_star_ 指针为空)
-            int nodes = -1;
-            double path_len = -1.0;
-            int init_cols = -1;
-            
-            if (bspline_optimizer_ != nullptr) {
-                init_cols = bspline_optimizer_->getInitCollisionPts();
-                if (bspline_optimizer_->a_star_ != nullptr) {
-                    nodes = bspline_optimizer_->a_star_->getExpandedNodes();
-                    path_len = bspline_optimizer_->a_star_->getPathLength();
-                }
-            }
-            // 写入所有核心评价指标
-            file << ros::Time::now().toSec() << ","
-                 << planner_type_ << ","
-                 << t_init.toSec() * 1000.0 << ","       
-                 << t_opt.toSec() * 1000.0 << ","        
-                 << bspline_optimizer_->getIterNum() << "," 
-                 << nodes << ","                         // 📈 新增：扩展节点数
-                 << path_len << ","                      // 📈 新增：拓扑路径长度
-                 << bspline_optimizer_->getInitCollisionPts() << "," // 📈 新增：碰撞控制点数
-                 << (is_success ? 1 : 0) << ","          
-                 << jerk_cost << "\n";                   
-            file.close();
-        }
-    };
-    /* ============================================================== */
-
     cout << "plan_success=" << flag_step_1_success << endl;
     if (!flag_step_1_success)
     {
+      ROS_ERROR_THROTTLE(0.5, "[PlannerManager] all candidate trajectories failed. plan_success=0");
       visualization_->displayOptimalList(ctrl_pts, 0);
       continous_failures_count_++;
-      log_ablation_data(false, -1.0); // 埋点：优化失败，Jerk 无效记为 -1.0
+      log_ablation_data(false, -1.0); // 鍩嬬偣锛氫紭鍖栧け璐ワ紝Jerk 鏃犳晥璁颁负 -1.0
       return false;
     }
 
@@ -364,7 +455,7 @@ namespace ego_planner
       {
         printf("\033[34mThis refined trajectory hits obstacles. It doesn't matter if appeares occasionally. But if continously appearing, Increase parameter \"lambda_fitness\".\n\033[0m");
         continous_failures_count_++;
-        log_ablation_data(false, -1.0); // 埋点：Refine 阶段撞墙失败
+        log_ablation_data(false, -1.0); // 鍩嬬偣锛歊efine 闃舵鎾炲澶辫触
         return false;
       }
     }
@@ -389,8 +480,7 @@ namespace ego_planner
 
 
     // =====================================================================
-    // 🚀 ABLATION STUDY LOGGER: 动力学与时间重分配实验埋点
-    // =====================================================================
+    // 馃殌 ABLATION STUDY LOGGER: 鍔ㄥ姏瀛︿笌鏃堕棿閲嶅垎閰嶅疄楠屽煁鐐?    // =====================================================================
     if (flag_step_1_success &&  (flag_step_2_success)) {
         UniformBspline vel_traj = pos.getDerivative();
         UniformBspline acc_traj = vel_traj.getDerivative();
@@ -399,7 +489,7 @@ namespace ego_planner
         double max_v = 0.0, max_a = 0.0, sum_v = 0.0;
         int sample_count = 0;
 
-        // 1. 采样提取微观动力学曲线数据 (每 0.02 秒采一个点)
+        // 1. 閲囨牱鎻愬彇寰鍔ㄥ姏瀛︽洸绾挎暟鎹?(姣?0.02 绉掗噰涓€涓偣)
         std::string home_dir = getenv("HOME");
         std::ofstream profile_file(home_dir + "/.ros/ego_vel_profile.csv", std::ios::out | std::ios::app);
         bool write_profile = profile_file.is_open();
@@ -417,7 +507,7 @@ namespace ego_planner
             sum_v += v_norm;
             sample_count++;
 
-            // 将局部速度曲线写入文件
+            // 灏嗗眬閮ㄩ€熷害鏇茬嚎鍐欏叆鏂囦欢
             if (write_profile) {
                 profile_file << local_data_.traj_id_ << "," << t << "," 
                              << v_norm << "," << a_norm << "," << time_scaling_method_ << "\n";
@@ -427,20 +517,20 @@ namespace ego_planner
 
         double avg_v = sum_v / sample_count;
 
-        // 2. 写入宏观统计数据
-        std::ofstream stats_file(home_dir + "/.ros/ego_macro_stats.csv", std::ios::out | std::ios::app);
-        if (stats_file.is_open()) {
-            if (stats_file.tellp() == 0) {
-                stats_file << "Timestamp,Method,Duration,Avg_Vel,Max_Vel,Max_Acc,Refine_Time_ms\n";
+        // 2. 鍐欏叆瀹忚缁熻鏁版嵁
+        std::ofstream macro_stats(home_dir + "/.ros/ego_macro_stats.csv", std::ios::out | std::ios::app);
+        if (macro_stats.is_open()) {
+            if (macro_stats.tellp() == 0) {
+                macro_stats << "Timestamp,Method,Duration,Avg_Vel,Max_Vel,Max_Acc,Refine_Time_ms\n";
             }
-            stats_file << ros::Time::now().toSec() << ","
+            macro_stats << ros::Time::now().toSec() << ","
                        << time_scaling_method_ << ","
                        << duration << ","
                        << avg_v << ","
                        << max_v << ","
                        << max_a << ","
                        << t_refine.toSec() * 1000.0 << "\n";
-            stats_file.close();
+            macro_stats.close();
         }
     }
     // =====================================================================
@@ -639,13 +729,9 @@ namespace ego_planner
 
     Eigen::MatrixXd ctrl_pts; // = traj.getControlPoint()
 
-    // std::cout << "ratio: " << ratio << std::endl;
-    //reparamBspline(traj, start_end_derivative, ratio, ctrl_pts, ts, t_inc);
-    if (time_scaling_method_ == "Global") {
+    // Planner layer always generates a conservative uniform fallback trajectory.
+    // Execution-layer speed changes are handled by traj_server EVTR.
     reparamBsplineGlobal(traj, start_end_derivative, ratio, ctrl_pts, ts, t_inc);
-} else {
-    reparamBsplineElastic(traj, start_end_derivative, ratio, ctrl_pts, ts, t_inc);
-}
 
     traj = UniformBspline(ctrl_pts, 3, ts);
 
@@ -693,71 +779,13 @@ namespace ego_planner
 
 // namespace ego_planner
 
-// ---------------- 修改位置: planner_manager.cpp ----------------
-// 用以下代码完全替换原有的 reparamBspline 函数
 
-// ---------------- 修改位置: planner_manager.cpp ----------------
-// 彻底重构的 True ETWR 算法：纯时域非均匀时间重分配
 void EGOPlannerManager::reparamBsplineElastic(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio, Eigen::MatrixXd &ctrl_pts, double &dt, double &time_inc)
-{
-    // 获取优化后的原始控制点（绝对不改变其空间几何位置）
-    ctrl_pts = bspline.getControlPoint();
-    int p = 3;
-    int n = ctrl_pts.cols() - 1; 
-    int m = n + p + 1; 
-
-    // 1. 基于弦长参数化 (Chord-Length) 的初始局部时间分配
-    // 强制目标速度逼近 pp_.max_vel_
-    std::vector<double> dt_intervals(n, 0.0);
-    for (int i = 0; i < n; ++i) {
-        double dist = (ctrl_pts.col(i+1) - ctrl_pts.col(i)).norm();
-        dt_intervals[i] = dist / pp_.max_vel_;
-        // 设定最低安全时间间隔
-        dt_intervals[i] = std::max(dt_intervals[i], 0.02);
-    }
-
-    // 2. 局部时间膨胀 (Local Time Dilation) —— 解决加速度超标问题
-    // 在急转弯处，速度方向变化剧烈，需要拉长局部时间来降低向心加速度
-    for (int pass = 0; pass < 2; ++pass) { // 两次滤波迭代，保证动力学平滑过渡
-        for (int i = 0; i < n - 1; ++i) {
-            Eigen::Vector3d v1 = (ctrl_pts.col(i+1) - ctrl_pts.col(i)) / dt_intervals[i];
-            Eigen::Vector3d v2 = (ctrl_pts.col(i+2) - ctrl_pts.col(i+1)) / dt_intervals[i+1];
-            
-            // 近似向心加速度计算
-            double acc = (v2 - v1).norm() / ((dt_intervals[i] + dt_intervals[i+1]) / 2.0);
-
-            if (acc > pp_.max_acc_) {
-                // 计算需要膨胀的时间比率
-                double dilation_ratio = sqrt(acc / pp_.max_acc_);
-                dt_intervals[i] *= dilation_ratio;
-                dt_intervals[i+1] *= dilation_ratio;
-            }
-        }
-    }
-
-    // 3. 构建非均匀节点向量 (Non-Uniform Knot Vector)
-    Eigen::VectorXd knots = Eigen::VectorXd::Zero(m + 1);
-    
-    // 起点约束 (Clamped Start)
-    for (int i = 0; i <= p; ++i) knots(i) = 0.0;
-
-    // 内部非均匀时间映射
-    for (int i = p + 1; i <= n; ++i) {
-        knots(i) = knots(i-1) + dt_intervals[i - p];
-    }
-
-    // 终点约束 (Clamped End)
-    for (int i = n + 1; i <= m; ++i) {
-        knots(i) = knots(i-1) + dt_intervals.back();
-    }
-
-    // 4. 将非均匀时间属性赋予轨迹，直接推给底层飞控！
-    bspline.setKnot(knots);
-    
-    // 更新状态机所需的时间增量
-    time_inc = knots(m - p) - knots(p);
-    
-    // 这里的 dt 仅作为格式兼容保留，因为底层 traj_server 实际上是依赖 knots 解析的
-    dt = dt_intervals[0]; 
-}
+  {
+    // Deprecated:
+    // Earlier Elastic versions tried to construct non-uniform knots in the
+    // planner layer. The current system keeps planner output uniform and lets
+    // traj_server perform execution-layer virtual time re-mapping.
+    reparamBsplineGlobal(bspline, start_end_derivative, ratio, ctrl_pts, dt, time_inc);
+  }
 }

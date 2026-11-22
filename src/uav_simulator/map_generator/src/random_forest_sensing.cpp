@@ -22,9 +22,10 @@ pcl::KdTreeFLANN<pcl::PointXYZ> kdtreeLocalMap;
 vector<int> pointIdxRadiusSearch;
 vector<float> pointRadiusSquaredDistance;
 
-random_device rd;
+//random_device rd;
 // default_random_engine eng(4);
-default_random_engine eng(rd()); 
+//default_random_engine eng(rd()); 
+default_random_engine eng;
 uniform_real_distribution<double> rand_x;
 uniform_real_distribution<double> rand_y;
 uniform_real_distribution<double> rand_w;
@@ -54,6 +55,8 @@ uniform_real_distribution<double> rand_radius_;
 uniform_real_distribution<double> rand_radius2_;
 uniform_real_distribution<double> rand_theta_;
 uniform_real_distribution<double> rand_z_;
+
+
 
 sensor_msgs::PointCloud2 globalMap_pcd;
 pcl::PointCloud<pcl::PointXYZ> cloudMap;
@@ -90,7 +93,7 @@ void RandomMapGenerate() {
       for (int s = -widNum / 2.0; s < widNum / 2.0; s++) {
         h = rand_h(eng);
         int heiNum = ceil(h / _resolution);
-        for (int t = -20; t < heiNum; t++) {
+        for (int t = 0; t < heiNum; t++) {
           pt_random.x = x + (r + 0.5) * _resolution + 1e-2;
           pt_random.y = y + (s + 0.5) * _resolution + 1e-2;
           pt_random.z = (t + 0.5) * _resolution + 1e-2;
@@ -196,12 +199,12 @@ void RandomMapGenerateCylinder() {
 
     int widNum = ceil((w*inf) / _resolution);
     double radius = (w*inf) / 2;
+    h = rand_h(eng);
+    int heiNum = ceil(h / _resolution);
 
     for (int r = -widNum / 2.0; r < widNum / 2.0; r++)
       for (int s = -widNum / 2.0; s < widNum / 2.0; s++) {
-        h = rand_h(eng);
-        int heiNum = ceil(h / _resolution);
-        for (int t = -20; t < heiNum; t++) {
+        for (int t = 0; t < heiNum; t++) {
           double temp_x = x + (r + 0.5) * _resolution + 1e-2;
           double temp_y = y + (s + 0.5) * _resolution + 1e-2;
           double temp_z = (t + 0.5) * _resolution + 1e-2;
@@ -347,7 +350,7 @@ void clickCallback(const geometry_msgs::PoseStamped& msg) {
     for (int s = -widNum / 2.0; s < widNum / 2.0; s++) {
       h = rand_h(eng);
       int heiNum = ceil(h / _resolution);
-      for (int t = -1; t < heiNum; t++) {
+      for (int t = 0; t < heiNum; t++) {
         pt_random.x = x + (r + 0.5) * _resolution + 1e-2;
         pt_random.y = y + (s + 0.5) * _resolution + 1e-2;
         pt_random.z = (t + 0.5) * _resolution + 1e-2;
@@ -380,6 +383,8 @@ int main(int argc, char** argv) {
   click_map_pub_ =
       n.advertise<sensor_msgs::PointCloud2>("/pcl_render_node/local_map", 1);
   // ros::Subscriber click_sub = n.subscribe("/goal", 10, clickCallback);
+  int seed;
+n.param("ObstacleShape/seed", seed, 1);
 
   n.param("init_state_x", _init_x, 0.0);
   n.param("init_state_y", _init_y, 0.0);
@@ -418,11 +423,11 @@ int main(int argc, char** argv) {
 
   ros::Duration(0.5).sleep();
 
-  unsigned int seed = rd();
+  //unsigned int seed = rd();
   // unsigned int seed = 2433201515;
   cout << "seed=" << seed << endl;
-  eng.seed(seed);
-
+  //eng.seed(seed);
+eng.seed(static_cast<unsigned int>(seed));
   // RandomMapGenerate();
   RandomMapGenerateCylinder();
 

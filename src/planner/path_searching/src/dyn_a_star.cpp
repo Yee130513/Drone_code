@@ -33,59 +33,177 @@ void AStar::initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size)
     grid_map_ = occ_map;
 }
 
-// ==================== dyn_a_star.cpp ====================
-// 在合适位置插入此内联函数
-
-inline int AStar::getClearancePenalty(const Eigen::Vector3d &pt)
+double AStar::estimateClearance(const Eigen::Vector3d &pt)
 {
-    int penalty = 0;
-    // 物理探测距离
-    double d = probe_dist_ * step_size_; 
-    
-    // 预定义 6 个方向的物理偏移量 (避免循环内动态创建 Eigen 对象)
-    const double offsets[6][3] = {
-        {d, 0, 0}, {-d, 0, 0}, 
-        {0, d, 0}, {0, -d, 0}, 
-        {0, 0, d}, {0, 0, -d}
+    if (grid_map_ == nullptr) return 0.0;
+    if (!grid_map_->isInMap(pt)) return 0.0;
+    if (checkOccupancy(pt)) return 0.0;
+
+    const double res = grid_map_->getResolution();
+    static const int dirs[6][3] = {
+        {1, 0, 0}, {-1, 0, 0},
+        {0, 1, 0}, {0, -1, 0},
+        {0, 0, 1}, {0, 0, -1}
     };
 
-    Eigen::Vector3i probe_idx;
-    for (int i = 0; i < 6; ++i)
+    for (int r = 1; r <= max_probe_steps_; ++r)
     {
-        Eigen::Vector3d probe_pt(pt(0) + offsets[i][0], pt(1) + offsets[i][1], pt(2) + offsets[i][2]);
-        
-        // 🚨 架构师约束：越界检查！
-        // Coord2Index 内部已包含边界检查，如果不合法 (越界)，则当做安全区域 (不增加惩罚)
-        if (!Coord2Index(probe_pt, probe_idx)) {
-            continue; 
-        }
+        const double d = r * res;
 
-        // 探测膨胀障碍物图
-        if (checkOccupancy(probe_pt)) {
-            penalty++;
+        for (int i = 0; i < 6; ++i)
+        {
+            Eigen::Vector3d probe_pt(
+                pt(0) + dirs[i][0] * d,
+                pt(1) + dirs[i][1] * d,
+                pt(2) + dirs[i][2] * d);
+
+            if (!grid_map_->isInMap(probe_pt))
+            {
+                return d;
+            }
+
+            if (checkOccupancy(probe_pt))
+            {
+                return d;
+            }
+
+            if (reject_unknown_ && grid_map_->isUnknown(probe_pt))
+            {
+                return d;
+            }
         }
     }
-    return penalty;
+
+    return (max_probe_steps_ + 1) * res;
 }
 
-bool AStar::lineOfSight(const Eigen::Vector3i &idx1, const Eigen::Vector3i &idx2)
+double AStar::getClearanceCost(const Eigen::Vector3d &pt)
 {
+    const double res = grid_map_ ? grid_map_->getResolution() : step_size_;
+    const double eps = std::max(0.5 * res, 1e-3);
+
+    double clearance = estimateClearance(pt);
+    if (clearance <= 1e-6)
+    {
+        return 1.0 / eps;
+    }
+
+    return 1.0 / std::max(clearance, eps);
+}
+
+double AStar::getTurnPenalty(GridNodePtr current,
+                             const Eigen::Vector3i &neighbor_idx) const
+{
+    if (current == nullptr || current->cameFrom == nullptr)
+    {
+        return 0.0;
+    }
+
+    Eigen::Vector3d a = (current->index - current->cameFrom->index).cast<double>();
+    Eigen::Vector3d b = (neighbor_idx - current->index).cast<double>();
+
+    double na = a.norm();
+    double nb = b.norm();
+    if (na < 1e-6 || nb < 1e-6)
+    {
+        return 0.0;
+    }
+
+    double dot = a.dot(b) / (na * nb);
+    dot = std::max(-1.0, std::min(1.0, dot));
+
+    return 1.0 - dot;
+}
+
+bool AStar::segmentFreeSampled(const Eigen::Vector3d &p1,
+                               const Eigen::Vector3d &p2)
+{
+    if (grid_map_ == nullptr) return false;
+
+    Eigen::Vector3d diff = p2 - p1;
+    double dist = diff.norm();
+
+    if (dist < 1e-6)
+    {
+        return grid_map_->isInMap(p1) && !checkOccupancy(p1);
+    }
+
+    const double res = grid_map_->getResolution();
+    const double sample_step = std::max(0.5 * res, 1e-3);
+    const int steps = std::max(1, static_cast<int>(std::ceil(dist / sample_step)));
+
+    for (int i = 0; i <= steps; ++i)
+    {
+        double s = static_cast<double>(i) / static_cast<double>(steps);
+        Eigen::Vector3d p = p1 + s * diff;
+
+        if (!grid_map_->isInMap(p))
+        {
+            return false;
+        }
+
+        if (checkOccupancy(p))
+        {
+            return false;
+        }
+
+        if (reject_unknown_ && grid_map_->isUnknown(p))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool AStar::edgeFeasible(const Eigen::Vector3i &idx1,
+                         const Eigen::Vector3i &idx2,
+                         bool conservative_check)
+{
+    if (grid_map_ == nullptr) return false;
+
     Eigen::Vector3d p1 = Index2Coord(idx1);
     Eigen::Vector3d p2 = Index2Coord(idx2);
-    Eigen::Vector3d dir = p2 - p1;
-    double dist = dir.norm();
-    
-    if (dist < 1e-4) return true;
-    dir /= dist;
-    
-    // 采用 0.5 倍栅格分辨率步进，保证绝对不会漏检薄墙
-    double step = step_size_ / 2.0; 
-    for (double d = step; d < dist; d += step)
+
+    if (!grid_map_->isInMap(p1) || !grid_map_->isInMap(p2))
     {
-        if (checkOccupancy(p1 + dir * d)) 
-            return false; // 中间有障碍物，视线被阻挡
+        return false;
     }
+
+    if (checkOccupancy(p1) || checkOccupancy(p2))
+    {
+        return false;
+    }
+
+    Eigen::Vector3d mid_pt = 0.5 * (p1 + p2);
+    if (!grid_map_->isInMap(mid_pt))
+    {
+        return false;
+    }
+
+    if (checkOccupancy(mid_pt))
+    {
+        return false;
+    }
+
+    if (reject_unknown_ &&
+        (grid_map_->isUnknown(p1) || grid_map_->isUnknown(mid_pt) || grid_map_->isUnknown(p2)))
+    {
+        return false;
+    }
+
+    if (conservative_check)
+    {
+        return segmentFreeSampled(p1, p2);
+    }
+
     return true;
+}
+
+bool AStar::lineOfSight(const Eigen::Vector3i &idx1,
+                        const Eigen::Vector3i &idx2)
+{
+    return edgeFeasible(idx1, idx2, true);
 }
 
 double AStar::getDiagHeu(GridNodePtr node1, GridNodePtr node2)
@@ -143,382 +261,505 @@ vector<GridNodePtr> AStar::retrievePath(GridNodePtr current)
     return path;
 }
 
-bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt, Vector3d end_pt, Vector3i &start_idx, Vector3i &end_idx)
+bool AStar::validateGridPath(const std::vector<GridNodePtr> &path,
+                             double *min_clearance)
+{
+    if (path.size() < 2)
+    {
+        last_fallback_reason_ = "PATH_TOO_SHORT";
+        return false;
+    }
+
+    double min_c = 1e9;
+
+    for (size_t i = 0; i < path.size(); ++i)
+    {
+        Eigen::Vector3d p = Index2Coord(path[i]->index);
+
+        if (!grid_map_->isInMap(p) || checkOccupancy(p))
+        {
+            last_fallback_reason_ = "PATH_NODE_IN_COLLISION";
+            return false;
+        }
+
+        min_c = std::min(min_c, estimateClearance(p));
+    }
+
+    for (size_t i = 1; i < path.size(); ++i)
+    {
+        if (!edgeFeasible(path[i - 1]->index, path[i]->index, true))
+        {
+            ++segment_check_fail_count_;
+            last_fallback_reason_ = "PATH_EDGE_COLLISION";
+            return false;
+        }
+    }
+
+    if (min_clearance != nullptr)
+    {
+        *min_clearance = min_c;
+    }
+
+    if (min_path_clearance_limit_ > 1e-6 && min_c < min_path_clearance_limit_)
+    {
+        last_fallback_reason_ = "PATH_CLEARANCE_TOO_LOW";
+        return false;
+    }
+
+    return true;
+}
+
+double AStar::computePathLength(const std::vector<Eigen::Vector3d> &path) const
+{
+    if (path.size() < 2)
+    {
+        return 0.0;
+    }
+
+    double length = 0.0;
+    for (size_t i = 1; i < path.size(); ++i)
+    {
+        length += (path[i] - path[i - 1]).norm();
+    }
+
+    return length;
+}
+
+bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt,
+                                                   Vector3d end_pt,
+                                                   Vector3i &start_idx,
+                                                   Vector3i &end_idx)
 {
     if (!Coord2Index(start_pt, start_idx) || !Coord2Index(end_pt, end_idx))
+    {
         return false;
+    }
+
+    const int max_adjust_steps = std::max(5, static_cast<int>(std::ceil(2.0 / std::max(step_size_, 1e-3))));
 
     if (checkOccupancy(Index2Coord(start_idx)))
     {
-        //ROS_WARN("Start point is insdide an obstacle.");
+        Eigen::Vector3d dir = start_pt - end_pt;
+        if (dir.norm() < 1e-6)
+        {
+            return false;
+        }
+
+        dir.normalize();
+
+        int adjust_cnt = 0;
         do
         {
-            start_pt = (start_pt - end_pt).normalized() * step_size_ + start_pt;
+            start_pt = start_pt + dir * step_size_;
+
             if (!Coord2Index(start_pt, start_idx))
+            {
                 return false;
+            }
+
+            ++adjust_cnt;
+            if (adjust_cnt > max_adjust_steps)
+            {
+                ROS_WARN("[A*] Failed to adjust start point out of obstacle.");
+                return false;
+            }
         } while (checkOccupancy(Index2Coord(start_idx)));
     }
 
     if (checkOccupancy(Index2Coord(end_idx)))
     {
-        //ROS_WARN("End point is insdide an obstacle.");
+        Eigen::Vector3d dir = end_pt - start_pt;
+        if (dir.norm() < 1e-6)
+        {
+            return false;
+        }
+
+        dir.normalize();
+
+        int adjust_cnt = 0;
         do
         {
-            end_pt = (end_pt - start_pt).normalized() * step_size_ + end_pt;
+            end_pt = end_pt + dir * step_size_;
+
             if (!Coord2Index(end_pt, end_idx))
+            {
                 return false;
+            }
+
+            ++adjust_cnt;
+            if (adjust_cnt > max_adjust_steps)
+            {
+                ROS_WARN("[A*] Failed to adjust end point out of obstacle.");
+                return false;
+            }
         } while (checkOccupancy(Index2Coord(end_idx)));
     }
 
     return true;
 }
-bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_pt)
+
+bool AStar::AstarSearch(const double step_size,
+                        Vector3d start_pt,
+                        Vector3d end_pt)
 {
-    expanded_nodes_ = 0; // 每次搜索前清零
-    ros::Time time_1 = ros::Time::now();
-    ++rounds_;
+    const ros::Time search_start_time = ros::Time::now();
+
+    auto finishSearch = [&](bool ok) -> bool
+    {
+        last_search_time_ms_ = (ros::Time::now() - search_start_time).toSec() * 1000.0;
+        return ok;
+    };
+
+    expanded_nodes_ = 0;
+    path_length_ = 0.0;
+    segment_check_fail_count_ = 0;
+    last_search_time_ms_ = 0.0;
+    last_min_clearance_ = 0.0;
+    used_fallback_ = false;
+    last_fallback_reason_ = "NONE";
+    gridPath_.clear();
+
+    if (step_size <= 1e-6)
+    {
+        last_fallback_reason_ = "INVALID_STEP_SIZE";
+        ROS_ERROR("[A*] Invalid step_size.");
+        return finishSearch(false);
+    }
 
     step_size_ = step_size;
-    inv_step_size_ = 1 / step_size;
-    center_ = (start_pt + end_pt) / 2;
+    inv_step_size_ = 1.0 / step_size_;
+    center_ = 0.5 * (start_pt + end_pt);
 
-    Vector3i start_idx, end_idx;
+    bool sca_ok = searchOnce(start_pt, end_pt, true);
+    if (sca_ok)
+    {
+        if (validateGridPath(gridPath_, &last_min_clearance_))
+        {
+            used_fallback_ = false;
+            return finishSearch(true);
+        }
+    }
+
+    std::string sca_fail_reason = last_fallback_reason_;
+    ROS_WARN_THROTTLE(0.5, "[SCA-A*] Fallback to dense A*. reason=%s", sca_fail_reason.c_str());
+
+    gridPath_.clear();
+
+    bool dense_ok = searchOnce(start_pt, end_pt, false);
+    if (dense_ok)
+    {
+        if (validateGridPath(gridPath_, &last_min_clearance_))
+        {
+            used_fallback_ = true;
+            last_fallback_reason_ = sca_fail_reason;
+            return finishSearch(true);
+        }
+    }
+
+    ROS_WARN_THROTTLE(0.5, "[A*] Dense fallback also failed. reason=%s", last_fallback_reason_.c_str());
+
+    gridPath_.clear();
+    used_fallback_ = true;
+    return finishSearch(false);
+}
+
+bool AStar::searchOnce(const Eigen::Vector3d &start_pt,
+                       const Eigen::Vector3d &end_pt,
+                       bool use_sca)
+{
+    ros::Time time_1 = ros::Time::now();
+
+    ++rounds_;
+
+    Eigen::Vector3i start_idx, end_idx;
     if (!ConvertToIndexAndAdjustStartEndPoints(start_pt, end_pt, start_idx, end_idx))
     {
-        ROS_ERROR("Unable to handle the initial or end point, force return!");
+        last_fallback_reason_ = use_sca ? "SCA_START_END_INVALID" : "DENSE_START_END_INVALID";
         return false;
     }
 
-    // 🚨 修复点 1：补全所有指针的声明！
     GridNodePtr startPtr = GridNodeMap_[start_idx(0)][start_idx(1)][start_idx(2)];
     GridNodePtr endPtr = GridNodeMap_[end_idx(0)][end_idx(1)][end_idx(2)];
-    GridNodePtr current = NULL;
-    GridNodePtr neighborPtr = NULL;
 
     std::priority_queue<GridNodePtr, std::vector<GridNodePtr>, NodeComparator> empty;
     openSet_.swap(empty);
 
     startPtr->index = start_idx;
     startPtr->rounds = rounds_;
-    startPtr->gScore = 0;
+    startPtr->gScore = 0.0;
     startPtr->fScore = getHeu(startPtr, endPtr);
     startPtr->state = GridNode::OPENSET;
     startPtr->cameFrom = NULL;
     openSet_.push(startPtr);
 
     endPtr->index = end_idx;
-    // ... [前置初始化代码保持原样] ...
-    // 稀疏 A* 正常绝不会超过 2000 次迭代。一旦超过，说明陷入死区或目标不可达，立刻熔断，避免引发内存溢出和 0.2s 线程卡死。
-    
 
-    int num_iter = 0;
+    const int expand_step = use_sca ? expand_step_ : dense_expand_step_;
+    const int max_expand_count = use_sca ? max_expand_count_sca_ : max_expand_count_fallback_;
+    const double max_search_time = use_sca ? max_search_time_sca_ : max_search_time_fallback_;
+
+    int local_expand_count = 0;
+
     while (!openSet_.empty())
     {
-        expanded_nodes_++; // 埋点 1：记录真实出队的节点数
-        num_iter++;
+        ros::Time now = ros::Time::now();
+        double elapsed = (now - time_1).toSec();
 
-        if (num_iter > 3000) {
-        ROS_WARN("[SCA-A*] Triggered Kill-switch! Goal unreachable or stuck in local minima.");
-        return false;
-    }
-        current = openSet_.top();
+        if (elapsed > max_search_time)
+        {
+            last_search_time_ms_ = elapsed * 1000.0;
+            last_fallback_reason_ = use_sca ? "SCA_TIMEOUT" : "DENSE_TIMEOUT";
+            return false;
+        }
+
+        GridNodePtr current = openSet_.top();
         openSet_.pop();
 
-        // 终点放宽判定 (不变)
-        double dx_goal = (double)(current->index(0) - endPtr->index(0));
-        double dy_goal = (double)(current->index(1) - endPtr->index(1));
-        double dz_goal = (double)(current->index(2) - endPtr->index(2));
-        double dist_to_goal = sqrt(dx_goal*dx_goal + dy_goal*dy_goal + dz_goal*dz_goal);
-
-        if (dist_to_goal <= expand_step_ * 1.74) 
+        if (current->state == GridNode::CLOSEDSET)
         {
-            // O(1) 终点防穿墙检查
-            Vector3i mid_to_goal = (current->index + endPtr->index) / 2;
-            if (!checkOccupancy(Index2Coord(mid_to_goal))) 
+            continue;
+        }
+
+        ++expanded_nodes_;
+        ++local_expand_count;
+
+        if (local_expand_count > max_expand_count)
+        {
+            last_search_time_ms_ = elapsed * 1000.0;
+            last_fallback_reason_ = use_sca ? "SCA_MAX_EXPAND" : "DENSE_MAX_EXPAND";
+            return false;
+        }
+
+        double dx_goal = static_cast<double>(current->index(0) - endPtr->index(0));
+        double dy_goal = static_cast<double>(current->index(1) - endPtr->index(1));
+        double dz_goal = static_cast<double>(current->index(2) - endPtr->index(2));
+        double dist_to_goal = std::sqrt(dx_goal * dx_goal + dy_goal * dy_goal + dz_goal * dz_goal);
+
+        bool reach_goal = false;
+        if (use_sca)
+        {
+            reach_goal = dist_to_goal <= expand_step * std::sqrt(3.0);
+        }
+        else
+        {
+            reach_goal = (current->index == endPtr->index);
+        }
+
+        if (reach_goal)
+        {
+            if (current->index == endPtr->index || edgeFeasible(current->index, endPtr->index, true))
             {
-                endPtr->cameFrom = current;
-                gridPath_ = retrievePath(endPtr);
+                if (current->index != endPtr->index)
+                {
+                    endPtr->rounds = rounds_;
+                    endPtr->state = GridNode::OPENSET;
+                    endPtr->cameFrom = current;
+                    endPtr->gScore = current->gScore + (Index2Coord(endPtr->index) - Index2Coord(current->index)).norm();
+                    endPtr->fScore = endPtr->gScore;
+                    gridPath_ = retrievePath(endPtr);
+                }
+                else
+                {
+                    gridPath_ = retrievePath(current);
+                }
+
+                last_search_time_ms_ = (ros::Time::now() - time_1).toSec() * 1000.0;
                 return true;
             }
         }
 
         current->state = GridNode::CLOSEDSET;
 
-        // =================================================================
-        // 🚀 极速引擎 2：提取父节点方向动量，用于无掉头剪枝
-        // =================================================================
-        Vector3d dir_from_parent = Vector3d::Zero();
-        if (current->cameFrom != NULL) {
-            dir_from_parent = (current->index - current->cameFrom->index).cast<double>().normalized();
+        double dynamic_epsilon = 1.0;
+        if (use_sca)
+        {
+            dynamic_epsilon = 1.0 + (epsilon_ - 1.0) * (dist_to_goal / (POOL_SIZE_(0) / 2.0));
+            dynamic_epsilon = std::max(1.0, std::min(dynamic_epsilon, epsilon_));
         }
 
-        // =================================================================
-        // 🚀 极速引擎 3：计算动态启发式权重 (离目标越近，贪婪度越低)
-        // =================================================================
-        double dynamic_epsilon = 1.0 + (epsilon_ - 1.0) * (dist_to_goal / (POOL_SIZE_(0) / 2.0));
-        dynamic_epsilon = std::max(1.1, std::min(dynamic_epsilon, epsilon_));
-
-        for (int dx_i = -expand_step_; dx_i <= expand_step_; dx_i += expand_step_)
-            for (int dy_i = -expand_step_; dy_i <= expand_step_; dy_i += expand_step_)
-                for (int dz_i = -expand_step_; dz_i <= expand_step_; dz_i += expand_step_)
+        for (int dx_i = -expand_step; dx_i <= expand_step; dx_i += expand_step)
+            for (int dy_i = -expand_step; dy_i <= expand_step; dy_i += expand_step)
+                for (int dz_i = -expand_step; dz_i <= expand_step; dz_i += expand_step)
                 {
-                    if (dx_i == 0 && dy_i == 0 && dz_i == 0) continue;
-
-                    // 🚀 极速引擎 2 (续)：无掉头剪枝 (No U-Turn Pruning)
-                    // 如果当前有运动方向，且尝试扩展的方向与来时方向相反（点积 < -0.5，夹角大于120度），直接剪枝！
-                    Vector3d dir_to_neighbor = Vector3d(dx_i, dy_i, dz_i).normalized();
-                    if (current->cameFrom != NULL && dir_from_parent.dot(dir_to_neighbor) < -0.5) {
-                        continue; 
+                    if (dx_i == 0 && dy_i == 0 && dz_i == 0)
+                    {
+                        continue;
                     }
 
-                    Vector3i neighborIdx(current->index(0) + dx_i, current->index(1) + dy_i, current->index(2) + dz_i);
+                    Eigen::Vector3i neighborIdx(
+                        current->index(0) + dx_i,
+                        current->index(1) + dy_i,
+                        current->index(2) + dz_i);
 
-                    // 边界检查
-                    if (neighborIdx(0) < 2 || neighborIdx(0) >= POOL_SIZE_(0) - 2 || 
-                        neighborIdx(1) < 2 || neighborIdx(1) >= POOL_SIZE_(1) - 2 || 
-                        neighborIdx(2) < 2 || neighborIdx(2) >= POOL_SIZE_(2) - 2)
+                    int margin = std::max(1, expand_step);
+                    if (neighborIdx(0) < margin || neighborIdx(0) >= POOL_SIZE_(0) - margin ||
+                        neighborIdx(1) < margin || neighborIdx(1) >= POOL_SIZE_(1) - margin ||
+                        neighborIdx(2) < margin || neighborIdx(2) >= POOL_SIZE_(2) - margin)
+                    {
                         continue;
+                    }
 
-                    neighborPtr = GridNodeMap_[neighborIdx(0)][neighborIdx(1)][neighborIdx(2)];
+                    GridNodePtr neighborPtr = GridNodeMap_[neighborIdx(0)][neighborIdx(1)][neighborIdx(2)];
                     neighborPtr->index = neighborIdx;
 
                     bool flag_explored = neighborPtr->rounds == rounds_;
-                    if (flag_explored && neighborPtr->state == GridNode::CLOSEDSET) continue;
+                    if (flag_explored && neighborPtr->state == GridNode::CLOSEDSET)
+                    {
+                        continue;
+                    }
+
+                    Eigen::Vector3d neighbor_pos = Index2Coord(neighborIdx);
+                    if (!grid_map_->isInMap(neighbor_pos))
+                    {
+                        continue;
+                    }
+
+                    if (checkOccupancy(neighbor_pos))
+                    {
+                        continue;
+                    }
+
+                    if (reject_unknown_ && grid_map_->isUnknown(neighbor_pos))
+                    {
+                        continue;
+                    }
+
+                    if (!edgeFeasible(current->index, neighborIdx, conservative_edge_check_))
+                    {
+                        ++segment_check_fail_count_;
+                        continue;
+                    }
 
                     neighborPtr->rounds = rounds_;
-                    Vector3d neighbor_pos = Index2Coord(neighborPtr->index);
-                    
-                    if (checkOccupancy(neighbor_pos)) continue;
 
-                    // =================================================================
-                    // 🚀 极速引擎 1：O(1) 极简防穿墙检测 (Midpoint Check)
-                    // 完全废弃昂贵的 lineOfSight 射线遍历，直接查两点的数学中点！
-                    // =================================================================
-                    Vector3i mid_idx = (current->index + neighborIdx) / 2;
-                    if (checkOccupancy(Index2Coord(mid_idx))) continue; 
+                    double move_cost = std::sqrt(
+                        static_cast<double>(dx_i * dx_i + dy_i * dy_i + dz_i * dz_i)) * step_size_;
 
-                    // 机制 3: 间隙探测
-                    int c_penalty = getClearancePenalty(neighbor_pos);
-                    
-                    double static_cost = sqrt(dx_i * dx_i + dy_i * dy_i + dz_i * dz_i) * step_size_;
-                    double tentative_gScore = current->gScore + static_cost;
+                    double clearance_cost = 0.0;
+                    double turn_cost = 0.0;
+                    if (use_sca)
+                    {
+                        clearance_cost = weight_clearance_ * getClearanceCost(neighbor_pos);
+                        turn_cost = weight_turn_ * getTurnPenalty(current, neighborIdx);
+                    }
+
+                    double tentative_gScore = current->gScore + move_cost + clearance_cost + turn_cost;
 
                     if (!flag_explored || tentative_gScore < neighborPtr->gScore)
                     {
                         neighborPtr->state = GridNode::OPENSET;
                         neighborPtr->cameFrom = current;
                         neighborPtr->gScore = tentative_gScore;
-                        
-                        // 使用动态 Epsilon 进行加速
-                        neighborPtr->fScore = tentative_gScore + 
-                                              dynamic_epsilon * getHeu(neighborPtr, endPtr) + 
-                                              weight_clearance_ * c_penalty;
+                        neighborPtr->fScore = tentative_gScore + dynamic_epsilon * getHeu(neighborPtr, endPtr);
                         openSet_.push(neighborPtr);
                     }
                 }
-        
-        // 超时保护
-        ros::Time time_2 = ros::Time::now();
-        if ((time_2 - time_1).toSec() > 0.2)
-        {
-            ROS_WARN("Failed in Fast-SCA-A* !!! 0.2s time limit exceeded. Iters: %d", num_iter);
-            return false;
-        }
     }
+
+    last_search_time_ms_ = (ros::Time::now() - time_1).toSec() * 1000.0;
+    last_fallback_reason_ = use_sca ? "SCA_OPENSET_EMPTY" : "DENSE_OPENSET_EMPTY";
     return false;
 }
-/*bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_pt)
-{
-    ros::Time time_1 = ros::Time::now();
-    ++rounds_;
-
-    step_size_ = step_size;
-    inv_step_size_ = 1 / step_size;
-    center_ = (start_pt + end_pt) / 2;
-
-    Vector3i start_idx, end_idx;
-    if (!ConvertToIndexAndAdjustStartEndPoints(start_pt, end_pt, start_idx, end_idx))
-    {
-        ROS_ERROR("Unable to handle the initial or end point, force return!");
-        return false;
-    }
-
-    // if ( start_pt(0) > -1 && start_pt(0) < 0 )
-    //     cout << "start_pt=" << start_pt.transpose() << " end_pt=" << end_pt.transpose() << endl;
-
-    GridNodePtr startPtr = GridNodeMap_[start_idx(0)][start_idx(1)][start_idx(2)];
-    GridNodePtr endPtr = GridNodeMap_[end_idx(0)][end_idx(1)][end_idx(2)];
-
-    std::priority_queue<GridNodePtr, std::vector<GridNodePtr>, NodeComparator> empty;
-    openSet_.swap(empty);
-
-    GridNodePtr neighborPtr = NULL;
-    GridNodePtr current = NULL;
-
-    startPtr->index = start_idx;
-    startPtr->rounds = rounds_;
-    startPtr->gScore = 0;
-    startPtr->fScore = getHeu(startPtr, endPtr);
-    startPtr->state = GridNode::OPENSET; //put start node in open set
-    startPtr->cameFrom = NULL;
-    openSet_.push(startPtr); //put start in open set
-
-    endPtr->index = end_idx;
-
-    double tentative_gScore;
-
-    int num_iter = 0;
-    while (!openSet_.empty())
-    {
-        num_iter++;
-        current = openSet_.top();
-        openSet_.pop();
-
-        // if ( num_iter < 10000 )
-        //     cout << "current=" << current->index.transpose() << endl;
-
-        if (current->index(0) == endPtr->index(0) && current->index(1) == endPtr->index(1) && current->index(2) == endPtr->index(2))
-        {
-            // ros::Time time_2 = ros::Time::now();
-            // printf("\033[34mA star iter:%d, time:%.3f\033[0m\n",num_iter, (time_2 - time_1).toSec()*1000);
-            // if((time_2 - time_1).toSec() > 0.1)
-            //     ROS_WARN("Time consume in A star path finding is %f", (time_2 - time_1).toSec() );
-            gridPath_ = retrievePath(current);
-            return true;
-        }
-        current->state = GridNode::CLOSEDSET; //move current node from open set to closed set.
-
-        for (int dx = -1; dx <= 1; dx++)
-            for (int dy = -1; dy <= 1; dy++)
-                for (int dz = -1; dz <= 1; dz++)
-                {
-                    if (dx == 0 && dy == 0 && dz == 0)
-                        continue;
-
-                    Vector3i neighborIdx;
-                    neighborIdx(0) = (current->index)(0) + dx;
-                    neighborIdx(1) = (current->index)(1) + dy;
-                    neighborIdx(2) = (current->index)(2) + dz;
-
-                    if (neighborIdx(0) < 1 || neighborIdx(0) >= POOL_SIZE_(0) - 1 || neighborIdx(1) < 1 || neighborIdx(1) >= POOL_SIZE_(1) - 1 || neighborIdx(2) < 1 || neighborIdx(2) >= POOL_SIZE_(2) - 1)
-                    {
-                        continue;
-                    }
-
-                    neighborPtr = GridNodeMap_[neighborIdx(0)][neighborIdx(1)][neighborIdx(2)];
-                    neighborPtr->index = neighborIdx;
-
-                    bool flag_explored = neighborPtr->rounds == rounds_;
-
-                    if (flag_explored && neighborPtr->state == GridNode::CLOSEDSET)
-                    {
-                        continue; //in closed set.
-                    }
-
-                    neighborPtr->rounds = rounds_;
-
-                    if (checkOccupancy(Index2Coord(neighborPtr->index)))
-                    {
-                        continue;
-                    }
-
-                    double static_cost = sqrt(dx * dx + dy * dy + dz * dz);
-                    tentative_gScore = current->gScore + static_cost;
-
-                    if (!flag_explored)
-                    {
-                        //discover a new node
-                        neighborPtr->state = GridNode::OPENSET;
-                        neighborPtr->cameFrom = current;
-                        neighborPtr->gScore = tentative_gScore;
-                        neighborPtr->fScore = tentative_gScore + getHeu(neighborPtr, endPtr);
-                        openSet_.push(neighborPtr); //put neighbor in open set and record it.
-                    }
-                    else if (tentative_gScore < neighborPtr->gScore)
-                    { //in open set and need update
-                        neighborPtr->cameFrom = current;
-                        neighborPtr->gScore = tentative_gScore;
-                        neighborPtr->fScore = tentative_gScore + getHeu(neighborPtr, endPtr);
-                    }
-                }
-        ros::Time time_2 = ros::Time::now();
-        if ((time_2 - time_1).toSec() > 0.2)
-        {
-            ROS_WARN("Failed in A star path searching !!! 0.2 seconds time limit exceeded.");
-            return false;
-        }
-    }
-
-    ros::Time time_2 = ros::Time::now();
-
-    if ((time_2 - time_1).toSec() > 0.1)
-        ROS_WARN("Time consume in A star path finding is %.3fs, iter=%d", (time_2 - time_1).toSec(), num_iter);
-
-    return false;
-}*/
 
 vector<Vector3d> AStar::getPath()
 {
     vector<Vector3d> raw_path;
+
     for (auto ptr : gridPath_)
+    {
         raw_path.push_back(Index2Coord(ptr->index));
+    }
+
     reverse(raw_path.begin(), raw_path.end());
 
-    if (raw_path.size() < 2) return raw_path;
+    if (raw_path.size() < 2)
+    {
+        path_length_ = computePathLength(raw_path);
+        return raw_path;
+    }
 
-    // =================================================================
-    // 🚀 新增极简视线剪枝 (LoS Pruning) - 消除锯齿，拯救 Jerk！
-    // =================================================================
+    double tmp_min_clearance = 0.0;
+    if (!validateGridPath(gridPath_, &tmp_min_clearance))
+    {
+        path_length_ = 0.0;
+        ROS_WARN_THROTTLE(0.5, "[A*] getPath rejected invalid gridPath. reason=%s", last_fallback_reason_.c_str());
+        return vector<Vector3d>();
+    }
+
     vector<Vector3d> pruned_path;
     pruned_path.push_back(raw_path.front());
 
     int current_idx = 0;
-    while (current_idx < (int)raw_path.size() - 1)
+    while (current_idx < static_cast<int>(raw_path.size()) - 1)
     {
-        int next_idx = raw_path.size() - 1;
-        // 从终点往回找，看 current_idx 能不能直接直线看到 next_idx
+        int next_idx = static_cast<int>(raw_path.size()) - 1;
+        bool found = false;
+
         while (next_idx > current_idx + 1)
         {
+            double shortcut_dist = (raw_path[next_idx] - raw_path[current_idx]).norm();
+            if (shortcut_dist > los_prune_max_dist_)
+            {
+                --next_idx;
+                continue;
+            }
+
             Eigen::Vector3i idx1, idx2;
-            Coord2Index(raw_path[current_idx], idx1);
-            Coord2Index(raw_path[next_idx], idx2);
-            
-            // 如果两点之间视线无遮挡，直接拉直线！
-            if (lineOfSight(idx1, idx2)) {
+            if (!Coord2Index(raw_path[current_idx], idx1) ||
+                !Coord2Index(raw_path[next_idx], idx2))
+            {
+                --next_idx;
+                continue;
+            }
+
+            if (lineOfSight(idx1, idx2))
+            {
+                found = true;
                 break;
             }
-            next_idx--;
+
+            --next_idx;
         }
+
+        if (!found)
+        {
+            next_idx = current_idx + 1;
+        }
+
         pruned_path.push_back(raw_path[next_idx]);
         current_idx = next_idx;
     }
 
-    // =================================================================
-    // 保持原有的稠密插值 (对剪枝后极其平滑的拉扯线进行 0.1m 插值)
-    // =================================================================
     vector<Vector3d> dense_path;
-    dense_path.push_back(pruned_path[0]); 
+    dense_path.push_back(pruned_path.front());
+
+    const double res = grid_map_ ? grid_map_->getResolution() : step_size_;
+    const double dense_step = std::max(0.5 * res, dense_sample_resolution_ratio_ * step_size_);
 
     for (size_t i = 1; i < pruned_path.size(); ++i)
     {
         Vector3d p1 = pruned_path[i - 1];
         Vector3d p2 = pruned_path[i];
-        
+
         double dist = (p2 - p1).norm();
-        int num_segments = std::max(1, (int)std::ceil(dist / step_size_)); 
+        int num_segments = std::max(1, static_cast<int>(std::ceil(dist / dense_step)));
 
         for (int j = 1; j <= num_segments; ++j)
         {
-            dense_path.push_back(p1 + (p2 - p1) * ((double)j / num_segments));
+            Vector3d p = p1 + (p2 - p1) * (static_cast<double>(j) / static_cast<double>(num_segments));
+
+            if (!grid_map_->isInMap(p) || checkOccupancy(p))
+            {
+                ++segment_check_fail_count_;
+                path_length_ = computePathLength(raw_path);
+                ROS_WARN_THROTTLE(0.5, "[A*] Dense path interpolation hits obstacle. Return raw path instead.");
+                return raw_path;
+            }
+
+            dense_path.push_back(p);
         }
     }
 
-    path_length_ = 0.0;
-    if (raw_path.size() > 1) {
-        for (size_t i = 0; i < raw_path.size() - 1; ++i) {
-            path_length_ += (raw_path[i+1] - raw_path[i]).norm();
-        }
-    }
-
+    path_length_ = computePathLength(dense_path);
     return dense_path;
 }

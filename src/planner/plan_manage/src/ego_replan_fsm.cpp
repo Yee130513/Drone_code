@@ -21,6 +21,15 @@ namespace ego_planner
     nh.param("fsm/emergency_time", emergency_time_, 1.0);
     nh.param("fsm/realworld_experiment", flag_realworld_experiment_, false);
     nh.param("fsm/fail_safe", enable_fail_safe_, true);
+    nh.param("fsm/max_replan_failures_before_emergency", max_replan_failures_before_emergency_, 3);
+    nh.param("fsm/emergency_hold_time", emergency_hold_time_, 1.0);
+    nh.param("fsm/replan_fail_retry_interval", replan_fail_retry_interval_, 0.5);
+    nh.param("fsm/sticky_emergency_after_plan_fail", sticky_emergency_after_plan_fail_, true);
+    max_replan_failures_before_emergency_ = std::max(1, max_replan_failures_before_emergency_);
+    emergency_hold_time_ = std::max(0.2, emergency_hold_time_);
+    replan_fail_retry_interval_ = std::max(0.1, replan_fail_retry_interval_);
+    last_emergency_time_ = ros::Time(0);
+    last_plan_fail_time_ = ros::Time(0);
 
     have_trigger_ = !flag_realworld_experiment_;
 
@@ -181,9 +190,11 @@ namespace ego_planner
       end_vel_.setZero();
       have_target_ = true;
       have_new_target_ = true;
+      planner_manager_->resetContinuousFailuresCount();
+      last_plan_fail_time_ = ros::Time(0);
 
       /*** FSM ***/
-      if (exec_state_ == WAIT_TARGET)
+      if (exec_state_ == WAIT_TARGET || exec_state_ == EMERGENCY_STOP)
         changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
       else
       {
@@ -407,6 +418,10 @@ namespace ego_planner
 
   void EGOReplanFSM::changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call)
   {
+    if (new_state == EMERGENCY_STOP && exec_state_ != EMERGENCY_STOP)
+    {
+      last_emergency_time_ = ros::Time::now();
+    }
 
     if (new_state == exec_state_)
       continously_called_times_++;
@@ -524,7 +539,20 @@ namespace ego_planner
       }
       else
       {
-        changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        last_plan_fail_time_ = ros::Time::now();
+
+        ROS_WARN_THROTTLE(0.5,
+                          "[FSM] GEN_NEW_TRAJ failed. continuous_failures=%d",
+                          planner_manager_->getContinuousFailuresCount());
+
+        if (planner_manager_->getContinuousFailuresCount() >= max_replan_failures_before_emergency_)
+        {
+          changeFSMExecState(EMERGENCY_STOP, "PLAN_FAIL_SAFE");
+        }
+        else
+        {
+          changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        }
       }
       break;
     }
@@ -541,7 +569,20 @@ namespace ego_planner
       }
       else
       {
-        changeFSMExecState(REPLAN_TRAJ, "FSM");
+        last_plan_fail_time_ = ros::Time::now();
+
+        ROS_WARN_THROTTLE(0.5,
+                          "[FSM] REPLAN_TRAJ failed. continuous_failures=%d",
+                          planner_manager_->getContinuousFailuresCount());
+
+        if (planner_manager_->getContinuousFailuresCount() >= max_replan_failures_before_emergency_)
+        {
+          changeFSMExecState(EMERGENCY_STOP, "PLAN_FAIL_SAFE");
+        }
+        else
+        {
+          changeFSMExecState(REPLAN_TRAJ, "FSM");
+        }
       }
 
       break;
@@ -597,18 +638,40 @@ namespace ego_planner
 
     case EMERGENCY_STOP:
     {
-
       if (flag_escape_emergency_) // Avoiding repeated calls
       {
         callEmergencyStop(odom_pos_);
-      }
-      else
-      {
-        if (enable_fail_safe_ && odom_vel_.norm() < 0.1)
-          changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        flag_escape_emergency_ = false;
+        break;
       }
 
-      flag_escape_emergency_ = false;
+      const double emergency_dt = (ros::Time::now() - last_emergency_time_).toSec();
+      const double fail_retry_dt = (ros::Time::now() - last_plan_fail_time_).toSec();
+
+      if (emergency_dt < emergency_hold_time_)
+      {
+        break;
+      }
+
+      if (sticky_emergency_after_plan_fail_ &&
+          planner_manager_->getContinuousFailuresCount() >= max_replan_failures_before_emergency_)
+      {
+        ROS_WARN_THROTTLE(1.0,
+                          "[FSM] stay in EMERGENCY_STOP: continuous planning failures=%d. Waiting for new target or map recovery.",
+                          planner_manager_->getContinuousFailuresCount());
+        break;
+      }
+
+      if (fail_retry_dt < replan_fail_retry_interval_)
+      {
+        break;
+      }
+
+      if (enable_fail_safe_ && odom_vel_.norm() < 0.1)
+      {
+        changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+      }
+
       break;
     }
     }
@@ -691,9 +754,9 @@ namespace ego_planner
     /* ---------- check lost of depth ---------- */
     if (map->getOdomDepthTimeout())
     {
-      ROS_ERROR("Depth Lost! EMERGENCY_STOP");
-      enable_fail_safe_ = false;
+      ROS_ERROR("Depth/Odom timeout! EMERGENCY_STOP");
       changeFSMExecState(EMERGENCY_STOP, "SAFETY");
+      return;
     }
 
     /* ---------- check trajectory ---------- */
@@ -767,6 +830,13 @@ namespace ego_planner
     have_new_target_ = false;
 
     cout << "refine_success=" << plan_and_refine_success << endl;
+
+    if (!plan_and_refine_success)
+    {
+      ROS_WARN("[FSM] callReboundReplan failed. continuous_failures=%d",
+               planner_manager_->getContinuousFailuresCount());
+      return false;
+    }
 
     if (plan_and_refine_success)
     {

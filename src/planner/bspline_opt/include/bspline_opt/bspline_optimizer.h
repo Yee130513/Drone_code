@@ -2,6 +2,10 @@
 #define _BSPLINE_OPTIMIZER_H_
 
 #include <Eigen/Eigen>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <string>
 //#include <path_searching/jps_theta_planner.h>
 #include <path_searching/dyn_a_star.h>
 //#include <path_searching/theta_star.h> 
@@ -30,8 +34,7 @@ namespace ego_planner
     std::vector<std::vector<Eigen::Vector3d>> direction;  // Direction vector, must be normalized.
     std::vector<bool> flag_temp;                          // A flag that used in many places. Initialize it everytime before using it.
     // std::vector<bool> occupancy;
-    // 🚀 新增：存储每个碰撞点对应的动态局部安全阈值
-    std::vector<std::vector<double>> local_clearance; 
+    std::vector<std::vector<double>> local_clearance; // per control point soft collision threshold, fallback to clearance when invalid
 
     void resize(const int size_set)
     {
@@ -39,14 +42,14 @@ namespace ego_planner
 
       base_point.clear();
       direction.clear();
-      local_clearance.clear(); // 🚀 新增
+      local_clearance.clear(); // 馃殌 鏂板
       flag_temp.clear();
       // occupancy.clear();
 
       points.resize(3, size_set);
       base_point.resize(size);
       direction.resize(size);
-      local_clearance.resize(size); // 🚀 新增
+      local_clearance.resize(size); // 馃殌 鏂板
       flag_temp.resize(size);
       // occupancy.resize(size);
     }
@@ -68,7 +71,7 @@ namespace ego_planner
       {
         buf.base_point[i - start] = base_point[i];
         buf.direction[i - start] = direction[i];
-         buf.local_clearance[i - start] = local_clearance[i]; // 🚀 新增数据同步
+         buf.local_clearance[i - start] = local_clearance[i]; // 馃殌 鏂板鏁版嵁鍚屾
         // if ( buf.base_point[i - start].size() > 1 )
         // {
         //   ROS_ERROR("buf.base_point[i - start].size()=%d, base_point[i].size()=%d", buf.base_point[i - start].size(), base_point[i].size());
@@ -134,9 +137,59 @@ namespace ego_planner
     inline double getSwarmClearance(void) { return swarm_clearance_; }
     inline int getIterNum(void) const { return iter_num_; }
     inline int getInitCollisionPts() const { return init_collision_pts_; }
+    inline bool getLastFrontendFailed() const { return last_frontend_failed_; }
+    inline std::string getLastFrontendFailReason() const { return last_frontend_fail_reason_; }
+    inline int getLastGuidePathCount() const { return last_guide_path_count_; }
+    inline int getLastGuideInvalidCount() const { return last_guide_invalid_count_; }
+    inline bool isDynamicClearanceEnabled() const { return enable_dynamic_clearance_; }
+    inline int getDynamicClearanceCount() const { return dynamic_clearance_count_; }
+    inline int getDynamicClearanceFallbackCount() const { return dynamic_clearance_fallback_count_; }
+    inline double getDynamicClearanceMin() const
+    {
+      return dynamic_clearance_count_ > 0 ? dynamic_clearance_min_ : cps_.clearance;
+    }
+    inline double getDynamicClearanceMean() const
+    {
+      return dynamic_clearance_count_ > 0 ? dynamic_clearance_sum_ / dynamic_clearance_count_ : cps_.clearance;
+    }
+    inline double getDynamicClearanceMax() const
+    {
+      return dynamic_clearance_count_ > 0 ? dynamic_clearance_max_ : cps_.clearance;
+    }
 
   private:
-  int init_collision_pts_{0};
+    int init_collision_pts_{0};
+
+    bool last_frontend_failed_{false};
+    std::string last_frontend_fail_reason_{"NONE"};
+    int last_guide_path_count_{0};
+    int last_guide_invalid_count_{0};
+
+    bool enable_guide_path_validation_{true};
+    bool enable_dynamic_clearance_{false};
+
+    int guide_min_points_{3};
+    double guide_endpoint_tolerance_{0.30};
+    double guide_validate_resolution_ratio_{0.50};
+
+    // dynamic safe threshold parameters
+    // Only affects rebound soft collision cost. It must not change grid_map hard collision checks.
+    double dynamic_clearance_gain_{0.25};
+    double dynamic_clearance_filter_alpha_{0.70};
+    double dynamic_clearance_upper_ratio_{1.20};
+    double dynamic_clearance_lower_ratio_{1.00};
+    double dynamic_clearance_global_max_{0.65};
+    double dynamic_clearance_min_guide_dist_{0.02};
+    bool dynamic_clearance_debug_{false};
+
+    // runtime state for smoothing and logging
+    std::vector<double> dynamic_clearance_prev_;
+    int dynamic_clearance_count_{0};
+    int dynamic_clearance_fallback_count_{0};
+    double dynamic_clearance_min_{0.0};
+    double dynamic_clearance_max_{0.0};
+    double dynamic_clearance_sum_{0.0};
+
     GridMap::Ptr grid_map_;
     fast_planner::ObjPredictor::Ptr moving_objs_;
     SwarmTrajData *swarm_trajs_{NULL}; // Can not use shared_ptr and no need to free
@@ -202,6 +255,29 @@ namespace ego_planner
     void calcSwarmCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     void calcFitnessCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     bool check_collision_and_rebound(void);
+    bool buildGuidePathForSegment(const Eigen::Vector3d& in,
+                                  const Eigen::Vector3d& out,
+                                  std::vector<Eigen::Vector3d>& guide_path,
+                                  std::string& fail_reason);
+    bool validateGuidePath(const std::vector<Eigen::Vector3d>& guide_path,
+                           const Eigen::Vector3d& in,
+                           const Eigen::Vector3d& out,
+                           std::string& fail_reason) const;
+    bool segmentFreeSampledForGuide(const Eigen::Vector3d& p0,
+                                    const Eigen::Vector3d& p1,
+                                    bool ignore_start_occupancy = false,
+                                    bool ignore_end_occupancy = false) const;
+    bool isFiniteVec(const Eigen::Vector3d& p) const;
+    bool isValidDirectionAndBase(const Eigen::Vector3d& base_pt,
+                                 const Eigen::Vector3d& direction) const;
+    inline double clampDouble(double x, double lo, double hi) const
+    {
+      return std::max(lo, std::min(hi, x));
+    }
+    void resetDynamicClearanceRuntime(int ctrl_pt_num);
+    double sanitizeLocalClearance(double sf_local) const;
+    void recordDynamicClearanceStat(double sf_local, bool fallback);
+    double computeLocalClearanceThreshold(double guide_deviation, int ctrl_pt_id);
 
     static int earlyExit(void *func_data, const double *x, const double *g, const double fx, const double xnorm, const double gnorm, const double step, int n, int k, int ls);
     static double costFunctionRebound(void *func_data, const double *x, double *grad, const int n);

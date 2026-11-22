@@ -119,8 +119,9 @@
         <param name="color/b" value="0.0"/>       
         <param name="covariance_scale" value="100.0"/>       
         <param name="robot_scale" value="1.0"/>
+        <param name="cross_config" value="true"/>
         <param name="tf45" value="false"/>
-        <param name="drone_id" value="drone_id"/>
+        <param name="drone_id" value="$(arg drone_id)"/>
   </node>
 
   <node pkg="local_sensing_node" type="pcl_render_node" name="drone_$(arg drone_id)_pcl_render_node" output="screen">

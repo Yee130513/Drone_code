@@ -1,15 +1,77 @@
 <launch>
     <!-- number of moving objects -->
-    <arg name="obj_num" value="10" />
+    <arg name="obj_num" value="0" />
     <arg name="drone_id" value="0"/>
+
+    <!-- ========================================================= -->
+    <!-- Experiment switches                                        -->
+    <!-- ========================================================= -->
+
+    <!-- Planner front-end -->
+    <arg name="planner_type" value="SCA_ASTAR"/>
+
+    <!-- Planner-side time allocation.
+         必须保持 Global，作为 traj_server 执行层 EVTR 的安全下界。Elastic Global -->
+    <arg name="planner_time_allocation_method" value="Global"/>
+
+    <!-- Backend dynamic safety threshold, default OFF for real flight -->
+    <arg name="enable_dynamic_clearance" value="true"/>
+
+    <!-- Execution-layer virtual time remapping, default OFF for first flight -->
+    <arg name="enable_exec_time_remap" value="true"/>
+    <arg name="exec_time_remap_mode" value="EVTR"/>
+
+
+    <arg name="max_vel" value="1.5" />
+    <arg name="max_acc" value="5.0" />
 
     <arg name="map_size_x" value="50.0"/>
     <arg name="map_size_y" value="25.0"/>
     <arg name="map_size_z" value=" 2.0"/>
     <arg name="odom_topic" value="visual_slam/odom" />
+    <arg name="enable_start_goal_marker" value="true"/>
+
+    <!-- Initial drone pose used by simulator and RViz debug markers -->
+    <arg name="init_x" value="-12"/>
+    <arg name="init_y" value="10"/>
+    <arg name="init_z" value="0.1"/>
+
+    <!-- 1: use 2D Nav Goal to select goal; 2: use global waypoints below -->
+    <arg name="flight_type" value="2" />
+
+    <!-- global waypoints -->
+    <arg name="point_num" value="1" />
+
+    <arg name="point0_x" value="12.0" />
+    <arg name="point0_y" value="-12.0" />
+    <arg name="point0_z" value="1.0" />
+
+    <arg name="point1_x" value="10.0" />
+    <arg name="point1_y" value="-10.0" />
+    <arg name="point1_z" value="1.0" />
+
+    <arg name="point2_x" value="10.0" />
+    <arg name="point2_y" value="-10.0" />
+    <arg name="point2_z" value="1.0" />
+
+    <arg name="point3_x" value="10.0" />
+    <arg name="point3_y" value="-10.0" />
+    <arg name="point3_z" value="1.0" />
+
+    <arg name="point4_x" value="10.0" />
+    <arg name="point4_y" value="-10.0" />
+    <arg name="point4_z" value="1.0" />
     
     <!-- map -->
-    <node pkg ="map_generator" name ="random_forest" type ="random_forest" output = "screen">
+  
+     <node pkg="pcl_ros" type="pcd_to_pointcloud" name="map_publisher" output="screen" 
+      args="/home/yee130513/shared_map.pcd 1.0">
+    <param name="frame_id" value="world" />
+    <param name="latch" value="true" />
+    <remap from="cloud_pcd" to="/map_generator/global_cloud" />
+    </node>
+      <!--
+       <node pkg ="map_generator" name ="random_forest" type ="random_forest" output = "screen">
         <param name="map/x_size" value="26" />
         <param name="map/y_size" value="20" />
         <param name="map/z_size" value="3" />
@@ -18,8 +80,8 @@
         <param name="map/obs_num" value="100"/>
         <param name="ObstacleShape/lower_rad" value="0.5"/>
         <param name="ObstacleShape/upper_rad" value="0.7"/>
-        <param name="ObstacleShape/lower_hei" value="0.0"/>
-        <param name="ObstacleShape/upper_hei" value="3.0"/>
+        <param name="ObstacleShape/lower_hei" value="1.0"/>
+        <param name="ObstacleShape/upper_hei" value="2.0"/>
         <param name="map/circle_num" value="100"/>
         <param name="ObstacleShape/radius_l" value="0.7"/>
         <param name="ObstacleShape/radius_h" value="0.5"/>
@@ -29,8 +91,10 @@
         <param name="pub_rate" value="1.0"/>
         <param name="min_distance" value="0.8"/>
     </node>
-
+-->
     <!-- main algorithm params -->
+   
+
     <include file="$(find ego_planner)/launch/advanced_param.xml">
         <arg name="drone_id" value="$(arg drone_id)"/>
         <arg name="map_size_x_" value="$(arg map_size_x)"/>
@@ -38,6 +102,12 @@
         <arg name="map_size_z_" value="$(arg map_size_z)"/>
         <arg name="odometry_topic" value="$(arg odom_topic)"/>
         <arg name="obj_num_set" value="$(arg obj_num)" />
+
+         <!-- Planner-layer switches -->
+        <arg name="planner_type" value="$(arg planner_type)"/>
+        <arg name="planner_time_allocation_method" value="$(arg planner_time_allocation_method)"/>
+        <arg name="enable_dynamic_clearance" value="$(arg enable_dynamic_clearance)"/>
+
         <!-- camera pose: transform of camera frame in the world frame -->
         <!-- depth topic: depth image, 640x480 by default -->
         <!-- don't set cloud_topic if you already set these ones! -->
@@ -52,41 +122,155 @@
         <arg name="fx" value="387.229248046875"/>
         <arg name="fy" value="387.229248046875"/>
         <!-- maximum velocity and acceleration the drone will reach -->
-        <arg name="max_vel" value="2.0" />
-        <arg name="max_acc" value="6.0" />
+        <arg name="max_vel" value="1.5" />
+        <arg name="max_acc" value="5.0" />
         <!--always set to 1.5 times grater than sensing horizen-->
         <arg name="planning_horizon" value="7.5" />
         <arg name="use_distinctive_trajs" value="true" />
         <!-- 1: use 2D Nav Goal to select goal  -->
         <!-- 2: use global waypoints below  -->
-        <arg name="flight_type" value="1" />
+        <arg name="flight_type" value="$(arg flight_type)" />
         <!-- global waypoints -->
         <!-- It generates a piecewise min-snap traj passing all waypoints -->
-        <arg name="point_num" value="4" />
-        <arg name="point0_x" value="15" />
-        <arg name="point0_y" value="0" />
-        <arg name="point0_z" value="1" />
-        <arg name="point1_x" value="-15.0" />
-        <arg name="point1_y" value="0.0" />
-        <arg name="point1_z" value="1.0" />
-        <arg name="point2_x" value="15.0" />
-        <arg name="point2_y" value="0.0" />
-        <arg name="point2_z" value="1.0" />
-        <arg name="point3_x" value="-15.0" />
-        <arg name="point3_y" value="0.0" />
-        <arg name="point3_z" value="1.0" />
-        <arg name="point4_x" value="15.0" />
-        <arg name="point4_y" value="0.0" />
-        <arg name="point4_z" value="1.0" />
-    </include>
+        <arg name="point_num" value="$(arg point_num)" />
+
+        <arg name="point0_x" value="$(arg point0_x)" />
+        <arg name="point0_y" value="$(arg point0_y)" />
+        <arg name="point0_z" value="$(arg point0_z)" />
+        
+        
+        <arg name="point1_x" value="$(arg point1_x)" />
+        <arg name="point1_y" value="$(arg point1_y)" />
+        <arg name="point1_z" value="$(arg point1_z)" />
+
+ 
+        <arg name="point2_x" value="$(arg point2_x)" />
+        <arg name="point2_y" value="$(arg point2_y)" />
+        <arg name="point2_z" value="$(arg point2_z)" />
+
+
+        <arg name="point3_x" value="$(arg point3_x)" />
+        <arg name="point3_y" value="$(arg point3_y)" />
+        <arg name="point3_z" value="$(arg point3_z)" />
+
+        <arg name="point4_x" value="$(arg point4_x)" />
+        <arg name="point4_y" value="$(arg point4_y)" />
+        <arg name="point4_z" value="$(arg point4_z)" />
+    
+   
+     </include>
     <!-- trajectory server -->
     <node pkg="ego_planner" name="drone_$(arg drone_id)_traj_server" type="traj_server" output="screen">
         <remap from="position_cmd" to="drone_$(arg drone_id)_planning/pos_cmd"/>
         <remap from="~planning/bspline" to="drone_$(arg drone_id)_planning/bspline"/>
         <param name="traj_server/time_forward" value="1.0" type="double"/>
+
+        <!-- ===================================================== -->
+        <!-- Execution-layer Virtual Time Re-mapping, EVTR          -->
+        <!-- 只改变 traj_server 沿 B-spline 采样的速度，不改变空间轨迹 -->
+        <!-- ===================================================== -->
+
+        <param name="traj_server/enable_virtual_time_remap"
+               value="$(arg enable_exec_time_remap)"
+               type="bool"/>
+
+        <param name="traj_server/time_remap_mode"
+               value="$(arg exec_time_remap_mode)"
+               type="string"/>
+
+        <!-- 动力学限制：traj_server 私有参数，不能指望读取 ego_planner_node 里的 manager/max_vel -->
+        <param name="traj_server/max_vel" value="$(arg max_vel)" type="double"/>
+        <param name="traj_server/max_acc" value="$(arg max_acc)" type="double"/>
+
+        <!-- α 上下界：首飞保守，仿真稳定后再放宽 -->
+        <param name="traj_server/alpha_min" value="0.40" type="double"/>
+        <param name="traj_server/alpha_max" value="1.50" type="double"/>
+
+        <!-- α 变化率限制，单位 1/s；下降可快，上升必须慢 -->
+        <param name="traj_server/alpha_rate_up" value="1.5" type="double"/>
+        <param name="traj_server/alpha_rate_down" value="4.0" type="double"/>
+
+        <!-- 前视窗口：提前看到急弯，避免当前直道末端过度加速 -->
+        <param name="traj_server/enable_lookahead_limit" value="true" type="bool"/>
+        <param name="traj_server/lookahead_time" value="0.60" type="double"/>
+        <param name="traj_server/lookahead_samples" value="6" type="int"/>
+        <param name="traj_server/dynamic_margin" value="0.90" type="double"/>
+
+        <!-- 链式求导加速度项：a = P'' alpha^2 + P' alpha_dot
+             首次测试可设 false，只启用 alpha_rate_limit；稳定后再设 true -->
+        <param name="traj_server/use_alpha_dot_acc" value="false" type="bool"/>
+
+        <!-- tracking error gate：实机建议开启，仿真调试可先关闭 -->
+        <param name="traj_server/enable_tracking_gate" value="false" type="bool"/>
+        <param name="traj_server/tracking_error_soft" value="0.20" type="double"/>
+        <param name="traj_server/tracking_error_hard" value="0.45" type="double"/>
+
+        <!-- 异常回退：回到原始时间推进 alpha = 1 -->
+        <param name="traj_server/enable_evtr_fallback" value="true" type="bool"/>
+        <param name="traj_server/fallback_to_global_on_error" value="true" type="bool"/>
+
+        <!-- dt 保护 -->
+        <param name="traj_server/max_timer_dt" value="0.05" type="double"/>
+        <param name="traj_server/default_timer_dt" value="0.01" type="double"/>
+
+        <!-- 日志 -->
+        <param name="traj_server/enable_evtr_log" value="true" type="bool"/>
+        <param name="traj_server/evtr_log_file" value="$(env HOME)/.ros/evtr_log.csv" type="string"/>
+        <param name="traj_server/evtr_debug" value="false" type="bool"/>
+
+        <!-- ===================================================== -->
+        <!-- Compatibility with old traj_server.cpp                 -->
+        <!-- 如果代码暂时还在读取 manager/time_scaling_method，保留这三行。
+             等 traj_server.cpp 改为读取 traj_server/enable_virtual_time_remap 后可以删除。 -->
+        <!-- ===================================================== -->
+        <param name="manager/max_vel" value="$(arg max_vel)" type="double"/>
+        <param name="manager/max_acc" value="$(arg max_acc)" type="double"/>
+        <param name="manager/time_scaling_method"
+               value="$(eval 'Elastic' if arg('enable_exec_time_remap') == 'true' else 'Global')"
+               type="string"/>
+               
     </node>
 
-    <!--<node name="rviz" pkg="rviz" type="rviz" args="-d $(find ego_planner)/launch/sim.rviz" required="true" />-->
+    <node if="$(arg enable_start_goal_marker)"
+          pkg="ego_planner"
+          type="start_goal_marker_node"
+          name="drone_$(arg drone_id)_start_goal_marker"
+          output="screen">
+
+        <param name="frame_id" value="world"/>
+        <param name="drone_id" value="$(arg drone_id)"/>
+        <param name="flight_type" value="$(arg flight_type)"/>
+
+        <param name="init_x" value="$(arg init_x)"/>
+        <param name="init_y" value="$(arg init_y)"/>
+        <param name="init_z" value="$(arg init_z)"/>
+
+        <param name="point_num" value="$(arg point_num)"/>
+
+        <param name="point0_x" value="$(arg point0_x)"/>
+        <param name="point0_y" value="$(arg point0_y)"/>
+        <param name="point0_z" value="$(arg point0_z)"/>
+
+        <param name="point1_x" value="$(arg point1_x)"/>
+        <param name="point1_y" value="$(arg point1_y)"/>
+        <param name="point1_z" value="$(arg point1_z)"/>
+
+        <param name="point2_x" value="$(arg point2_x)"/>
+        <param name="point2_y" value="$(arg point2_y)"/>
+        <param name="point2_z" value="$(arg point2_z)"/>
+
+        <param name="point3_x" value="$(arg point3_x)"/>
+        <param name="point3_y" value="$(arg point3_y)"/>
+        <param name="point3_z" value="$(arg point3_z)"/>
+
+        <param name="point4_x" value="$(arg point4_x)"/>
+        <param name="point4_y" value="$(arg point4_y)"/>
+        <param name="point4_z" value="$(arg point4_z)"/>
+
+        <param name="marker_rate" value="2.0"/>
+    </node>
+
+    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find ego_planner)/launch/sim_drone0_debug.rviz" required="true" />
 
     <!-- use simulator -->
     <include file="$(find ego_planner)/launch/simulator.xml">
@@ -94,9 +278,9 @@
         <arg name="map_size_x_" value="$(arg map_size_x)"/>
         <arg name="map_size_y_" value="$(arg map_size_y)"/>
         <arg name="map_size_z_" value="$(arg map_size_z)"/>
-        <arg name="init_x_" value="-15"/>
-        <arg name="init_y_" value="0"/>
-        <arg name="init_z_" value="0.1"/>
+       <arg name="init_x_" value="$(arg init_x)"/><!--无人机起始位置-->
+        <arg name="init_y_" value="$(arg init_y)"/>
+        <arg name="init_z_" value="$(arg init_z)"/>
         <arg name="odometry_topic" value="$(arg odom_topic)" />
     </include>
 </launch>

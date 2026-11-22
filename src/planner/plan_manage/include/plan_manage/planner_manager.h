@@ -3,6 +3,7 @@
 
 #include <fstream>
 #include <cstdlib>
+#include <string>
 
 #include <stdlib.h>
 
@@ -48,6 +49,8 @@ namespace ego_planner
     double getSwarmClearance(void) { return bspline_optimizer_->getSwarmClearance(); }
 
     bool checkCollision(int drone_id);
+    inline int getContinuousFailuresCount() const { return continous_failures_count_; }
+    inline void resetContinuousFailuresCount() { continous_failures_count_ = 0; }
     
 
     PlanParameters pp_;
@@ -79,10 +82,14 @@ namespace ego_planner
     // !SECTION stable
 
     // SECTION developing
-    std::string time_scaling_method_; // "Global" or "Elastic"
+    // Deprecated name. This now only represents conservative planner-layer
+    // time allocation for the uniform fallback trajectory.
+    std::string time_scaling_method_;
 
 // 声明两种不同的重采样函数
 void reparamBsplineGlobal(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio, Eigen::MatrixXd &ctrl_pts, double &dt, double &time_inc);
+// Deprecated wrapper: current implementation directly calls reparamBsplineGlobal.
+// Non-uniform knots are no longer generated in the planner layer.
 void reparamBsplineElastic(UniformBspline &bspline, vector<Eigen::Vector3d> &start_end_derivative, double ratio, Eigen::MatrixXd &ctrl_pts, double &dt, double &time_inc);
 
   public:

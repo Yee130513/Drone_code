@@ -128,7 +128,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
       node_.subscribe<nav_msgs::Odometry>("grid_map/odom", 10, &GridMap::odomCallback, this);
 
   occ_timer_ = node_.createTimer(ros::Duration(0.05), &GridMap::updateOccupancyCallback, this);
-  vis_timer_ = node_.createTimer(ros::Duration(0.11), &GridMap::visCallback, this);
+  vis_timer_ = node_.createTimer(ros::Duration(0.25), &GridMap::visCallback, this);
 
   map_pub_ = node_.advertise<sensor_msgs::PointCloud2>("grid_map/occupancy", 10);
   map_inf_pub_ = node_.advertise<sensor_msgs::PointCloud2>("grid_map/occupancy_inflate", 10);
@@ -231,7 +231,8 @@ void GridMap::projectDepthImage()
       {
 
         Eigen::Vector3d proj_pt;
-        depth = (*row_ptr++) / mp_.k_depth_scaling_factor_;
+        //depth = (*row_ptr++) / mp_.k_depth_scaling_factor_;
+        depth = md_.depth_image_.at<uint16_t>(v, u) / mp_.k_depth_scaling_factor_;
         proj_pt(0) = (u - mp_.cx_) * depth / mp_.fx_;
         proj_pt(1) = (v - mp_.cy_) * depth / mp_.fy_;
         proj_pt(2) = depth;

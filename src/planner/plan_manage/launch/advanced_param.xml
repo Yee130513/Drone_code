@@ -17,6 +17,10 @@
   <arg name="max_acc"/>
   <arg name="planning_horizon"/>
 
+  <arg name="planner_type" default="NONE"/>
+  <arg name="planner_time_allocation_method" default="Global"/>
+  <arg name="enable_dynamic_clearance" default="false"/>
+
   <arg name="point_num"/>
   <arg name="point0_x"/>
   <arg name="point0_y"/>
@@ -67,6 +71,10 @@
     <param name="fsm/emergency_time" value="1.0" type="double"/>
     <param name="fsm/realworld_experiment" value="false"/>
     <param name="fsm/fail_safe" value="true"/>
+    <param name="fsm/max_replan_failures_before_emergency" value="3" type="int"/>
+    <param name="fsm/emergency_hold_time" value="1.0" type="double"/>
+    <param name="fsm/replan_fail_retry_interval" value="0.5" type="double"/>
+    <param name="fsm/sticky_emergency_after_plan_fail" value="true" type="bool"/>
 
     <param name="fsm/waypoint_num" value="$(arg point_num)" type="int"/>
     <param name="fsm/waypoint0_x" value="$(arg point0_x)" type="double"/>
@@ -100,6 +108,22 @@
     <param name="grid_map/cy" value="$(arg cy)"/>
     <param name="grid_map/fx" value="$(arg fx)"/>
     <param name="grid_map/fy" value="$(arg fy)"/>
+
+    <!--<param name="manager/planner_type" value="SCA_ASTAR" type="string"/>-->
+    <!--<param name="manager/time_scaling_method" value="Global" type="string"/>-->
+     <param name="manager/planner_type"
+           value="$(arg planner_type)"
+           type="string"/>
+
+    <!-- 保持 Global：planner_manager 只负责生成保守 uniform fallback -->
+    <param name="manager/time_scaling_method"
+           value="$(arg planner_time_allocation_method)"
+           type="string"/>
+
+    <param name="optimization/enable_dynamic_clearance"
+           value="$(arg enable_dynamic_clearance)"
+           type="bool"/>
+
     <!-- depth filter -->
     <param name="grid_map/use_depth_filter" value="true"/>
     <param name="grid_map/depth_filter_tolerance" value="0.15"/>
@@ -142,6 +166,23 @@
     <param name="optimization/swarm_clearance" value="0.5" type="double"/>
     <param name="optimization/max_vel" value="$(arg max_vel)" type="double"/>
     <param name="optimization/max_acc" value="$(arg max_acc)" type="double"/>
+    <param name="optimization/enable_guide_path_validation" value="true" type="bool"/>
+
+    <!-- Dynamic safety threshold: default OFF to keep the SCA-A* baseline stable. -->
+  <!--  <param name="optimization/enable_dynamic_clearance" value="false" type="bool"/>-->
+
+    <param name="optimization/guide_min_points" value="3" type="int"/>
+    <param name="optimization/guide_endpoint_tolerance" value="0.30" type="double"/>
+    <param name="optimization/guide_validate_resolution_ratio" value="0.50" type="double"/>
+
+    <param name="optimization/dynamic_clearance_gain" value="0.25" type="double"/>
+    <param name="optimization/dynamic_clearance_filter_alpha" value="0.70" type="double"/>
+    <param name="optimization/dynamic_clearance_upper_ratio" value="1.20" type="double"/>
+    <param name="optimization/dynamic_clearance_lower_ratio" value="1.00" type="double"/>
+    <param name="optimization/dynamic_clearance_global_max" value="0.65" type="double"/>
+    <param name="optimization/dynamic_clearance_min_guide_dist" value="0.02" type="double"/>
+    <param name="optimization/dynamic_clearance_debug" value="false" type="bool"/>
+     
 
     <param name="bspline/limit_vel" value="$(arg max_vel)" type="double"/>
     <param name="bspline/limit_acc" value="$(arg max_acc)" type="double"/>

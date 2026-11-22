@@ -18,6 +18,351 @@ namespace ego_planner
     nh.param("optimization/max_acc", max_acc_, -1.0);
 
     nh.param("optimization/order", order_, 3);
+
+    nh.param("optimization/enable_guide_path_validation", enable_guide_path_validation_, true);
+    nh.param("optimization/enable_dynamic_clearance", enable_dynamic_clearance_, false);
+
+    nh.param("optimization/guide_min_points", guide_min_points_, 3);
+    nh.param("optimization/guide_endpoint_tolerance", guide_endpoint_tolerance_, 0.30);
+    nh.param("optimization/guide_validate_resolution_ratio", guide_validate_resolution_ratio_, 0.50);
+
+    nh.param("optimization/dynamic_clearance_gain", dynamic_clearance_gain_, 0.25);
+    nh.param("optimization/dynamic_clearance_filter_alpha", dynamic_clearance_filter_alpha_, 0.70);
+    nh.param("optimization/dynamic_clearance_upper_ratio", dynamic_clearance_upper_ratio_, 1.20);
+    nh.param("optimization/dynamic_clearance_lower_ratio", dynamic_clearance_lower_ratio_, 1.00);
+    nh.param("optimization/dynamic_clearance_global_max", dynamic_clearance_global_max_, 0.65);
+    nh.param("optimization/dynamic_clearance_min_guide_dist", dynamic_clearance_min_guide_dist_, 0.02);
+    nh.param("optimization/dynamic_clearance_debug", dynamic_clearance_debug_, false);
+
+    guide_min_points_ = std::max(2, guide_min_points_);
+    guide_validate_resolution_ratio_ = clampDouble(guide_validate_resolution_ratio_, 0.25, 1.00);
+
+    dynamic_clearance_gain_ = clampDouble(dynamic_clearance_gain_, 0.0, 1.0);
+    dynamic_clearance_filter_alpha_ = clampDouble(dynamic_clearance_filter_alpha_, 0.0, 0.95);
+    dynamic_clearance_upper_ratio_ = std::max(1.0, dynamic_clearance_upper_ratio_);
+    dynamic_clearance_lower_ratio_ = clampDouble(dynamic_clearance_lower_ratio_, 1.0, dynamic_clearance_upper_ratio_);
+    dynamic_clearance_global_max_ = std::max(0.0, dynamic_clearance_global_max_);
+    dynamic_clearance_min_guide_dist_ = std::max(0.0, dynamic_clearance_min_guide_dist_);
+  }
+
+  bool BsplineOptimizer::isFiniteVec(const Eigen::Vector3d& p) const
+  {
+    return std::isfinite(p.x()) && std::isfinite(p.y()) && std::isfinite(p.z());
+  }
+
+  bool BsplineOptimizer::segmentFreeSampledForGuide(const Eigen::Vector3d& p0,
+                                                    const Eigen::Vector3d& p1,
+                                                    bool ignore_start_occupancy,
+                                                    bool ignore_end_occupancy) const
+  {
+    if (!grid_map_) return false;
+    if (!isFiniteVec(p0) || !isFiniteVec(p1)) return false;
+    if (!grid_map_->isInMap(p0) || !grid_map_->isInMap(p1)) return false;
+
+    const Eigen::Vector3d diff = p1 - p0;
+    const double len = diff.norm();
+    if (len < 1e-6)
+    {
+      if (!ignore_start_occupancy && grid_map_->getInflateOccupancy(p0)) return false;
+      if (!ignore_end_occupancy && grid_map_->getInflateOccupancy(p1)) return false;
+      return true;
+    }
+
+    const double res = grid_map_->getResolution();
+    const double sample_step = std::max(1e-3, guide_validate_resolution_ratio_ * res);
+    const int steps = std::max(1, static_cast<int>(std::ceil(len / sample_step)));
+
+    for (int i = 0; i <= steps; ++i)
+    {
+      const double s = static_cast<double>(i) / static_cast<double>(steps);
+      const bool is_start_sample = (i == 0);
+      const bool is_end_sample = (i == steps);
+
+      if ((is_start_sample && ignore_start_occupancy) ||
+          (is_end_sample && ignore_end_occupancy))
+      {
+        continue;
+      }
+
+      const Eigen::Vector3d p = p0 + s * diff;
+
+      if (!grid_map_->isInMap(p)) return false;
+      if (grid_map_->getInflateOccupancy(p)) return false;
+    }
+
+    return true;
+  }
+
+  bool BsplineOptimizer::validateGuidePath(const std::vector<Eigen::Vector3d>& guide_path,
+                                           const Eigen::Vector3d& in,
+                                           const Eigen::Vector3d& out,
+                                           std::string& fail_reason) const
+  {
+    fail_reason = "NONE";
+
+    if (!enable_guide_path_validation_)
+    {
+      return true;
+    }
+
+    if (!grid_map_)
+    {
+      fail_reason = "NO_GRID_MAP";
+      return false;
+    }
+
+    if (guide_path.size() < static_cast<size_t>(guide_min_points_))
+    {
+      fail_reason = "GUIDE_TOO_SHORT";
+      return false;
+    }
+
+    if (!isFiniteVec(in) || !isFiniteVec(out))
+    {
+      fail_reason = "SEGMENT_ENDPOINT_NAN";
+      return false;
+    }
+
+    if ((guide_path.front() - in).norm() > guide_endpoint_tolerance_)
+    {
+      fail_reason = "GUIDE_START_TOO_FAR";
+      return false;
+    }
+
+    if ((guide_path.back() - out).norm() > guide_endpoint_tolerance_)
+    {
+      fail_reason = "GUIDE_END_TOO_FAR";
+      return false;
+    }
+
+    for (size_t i = 0; i < guide_path.size(); ++i)
+    {
+      if (!isFiniteVec(guide_path[i]))
+      {
+        fail_reason = "GUIDE_POINT_NAN";
+        return false;
+      }
+
+      if (!grid_map_->isInMap(guide_path[i]))
+      {
+        fail_reason = "GUIDE_POINT_OUT_OF_MAP";
+        return false;
+      }
+
+      const bool is_endpoint = (i == 0 || i + 1 == guide_path.size());
+
+      if (!is_endpoint && grid_map_->getInflateOccupancy(guide_path[i]))
+      {
+        fail_reason = "GUIDE_POINT_IN_COLLISION";
+        return false;
+      }
+    }
+
+    for (size_t i = 1; i < guide_path.size(); ++i)
+    {
+      const bool ignore_start = (i == 1);
+      const bool ignore_end = (i + 1 == guide_path.size());
+
+      if (!segmentFreeSampledForGuide(guide_path[i - 1], guide_path[i],
+                                      ignore_start, ignore_end))
+      {
+        fail_reason = "GUIDE_EDGE_COLLISION";
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  bool BsplineOptimizer::buildGuidePathForSegment(const Eigen::Vector3d& in,
+                                                  const Eigen::Vector3d& out,
+                                                  std::vector<Eigen::Vector3d>& guide_path,
+                                                  std::string& fail_reason)
+  {
+    guide_path.clear();
+    fail_reason = "NONE";
+
+    if (!a_star_)
+    {
+      fail_reason = "NO_ASTAR";
+      return false;
+    }
+
+    if (!grid_map_)
+    {
+      fail_reason = "NO_GRID_MAP";
+      return false;
+    }
+
+    if (!isFiniteVec(in) || !isFiniteVec(out))
+    {
+      fail_reason = "ASTAR_ENDPOINT_NAN";
+      return false;
+    }
+
+    const bool ok = a_star_->AstarSearch(0.1, in, out);
+    if (!ok)
+    {
+      fail_reason = "ASTAR_SEARCH_FAILED";
+      return false;
+    }
+
+    guide_path = a_star_->getPath();
+    if (!validateGuidePath(guide_path, in, out, fail_reason))
+    {
+      return false;
+    }
+
+    return true;
+  }
+
+  bool BsplineOptimizer::isValidDirectionAndBase(const Eigen::Vector3d& base_pt,
+                                                 const Eigen::Vector3d& direction) const
+  {
+    if (!isFiniteVec(base_pt) || !isFiniteVec(direction)) return false;
+    if (direction.norm() < 1e-5) return false;
+    if (!grid_map_) return false;
+    if (!grid_map_->isInMap(base_pt)) return false;
+
+    return true;
+  }
+
+  void BsplineOptimizer::resetDynamicClearanceRuntime(int ctrl_pt_num)
+  {
+    const double base = std::isfinite(cps_.clearance) && cps_.clearance > 1e-6 ? cps_.clearance : dist0_;
+    const int n = std::max(0, ctrl_pt_num);
+
+    dynamic_clearance_prev_.assign(n, base);
+    dynamic_clearance_count_ = 0;
+    dynamic_clearance_fallback_count_ = 0;
+    dynamic_clearance_min_ = base;
+    dynamic_clearance_max_ = base;
+    dynamic_clearance_sum_ = 0.0;
+  }
+
+  double BsplineOptimizer::sanitizeLocalClearance(double sf_local) const
+  {
+    const double base = std::isfinite(cps_.clearance) && cps_.clearance > 1e-6 ? cps_.clearance : dist0_;
+    if (!std::isfinite(base) || base <= 1e-6)
+    {
+      return dist0_ > 1e-6 ? dist0_ : 0.3;
+    }
+
+    const double lower = std::max(base, dynamic_clearance_lower_ratio_ * base);
+    const double upper_by_ratio = dynamic_clearance_upper_ratio_ * base;
+    const double upper_by_global = dynamic_clearance_global_max_ > 1e-6 ? dynamic_clearance_global_max_ : upper_by_ratio;
+    const double upper = std::min(upper_by_ratio, upper_by_global);
+
+    if (!std::isfinite(sf_local) || sf_local <= 1e-6 || upper < lower)
+    {
+      return base;
+    }
+
+    return clampDouble(sf_local, lower, upper);
+  }
+
+  void BsplineOptimizer::recordDynamicClearanceStat(double sf_local, bool fallback)
+  {
+    if (!std::isfinite(sf_local))
+    {
+      sf_local = cps_.clearance;
+      fallback = true;
+    }
+
+    if (dynamic_clearance_count_ == 0)
+    {
+      dynamic_clearance_min_ = sf_local;
+      dynamic_clearance_max_ = sf_local;
+      dynamic_clearance_sum_ = sf_local;
+    }
+    else
+    {
+      dynamic_clearance_min_ = std::min(dynamic_clearance_min_, sf_local);
+      dynamic_clearance_max_ = std::max(dynamic_clearance_max_, sf_local);
+      dynamic_clearance_sum_ += sf_local;
+    }
+
+    ++dynamic_clearance_count_;
+    if (fallback)
+    {
+      ++dynamic_clearance_fallback_count_;
+    }
+  }
+
+  double BsplineOptimizer::computeLocalClearanceThreshold(double guide_deviation, int ctrl_pt_id)
+  {
+    const double base = std::isfinite(cps_.clearance) && cps_.clearance > 1e-6 ? cps_.clearance : dist0_;
+
+    auto fallbackToBase = [&]() -> double
+    {
+      const double sf = sanitizeLocalClearance(base);
+
+      if (ctrl_pt_id >= 0 && ctrl_pt_id < static_cast<int>(dynamic_clearance_prev_.size()))
+      {
+        dynamic_clearance_prev_[ctrl_pt_id] = sf;
+      }
+
+      recordDynamicClearanceStat(sf, true);
+      return sf;
+    };
+
+    if (!enable_dynamic_clearance_)
+    {
+      return fallbackToBase();
+    }
+
+    if (!grid_map_ || !std::isfinite(base) || base <= 1e-6)
+    {
+      return fallbackToBase();
+    }
+
+    if (!std::isfinite(guide_deviation) || guide_deviation < dynamic_clearance_min_guide_dist_)
+    {
+      return fallbackToBase();
+    }
+
+    if (ctrl_pt_id < 0 || ctrl_pt_id >= cps_.size)
+    {
+      return fallbackToBase();
+    }
+
+    if (static_cast<int>(dynamic_clearance_prev_.size()) != cps_.size)
+    {
+      dynamic_clearance_prev_.assign(cps_.size, base);
+    }
+
+    const double lower = std::max(base, dynamic_clearance_lower_ratio_ * base);
+    const double upper_by_ratio = dynamic_clearance_upper_ratio_ * base;
+    const double upper_by_global = dynamic_clearance_global_max_ > 1e-6 ? dynamic_clearance_global_max_ : upper_by_ratio;
+    const double cap = std::min(upper_by_ratio, upper_by_global);
+
+    if (!std::isfinite(cap) || cap < lower)
+    {
+      return fallbackToBase();
+    }
+
+    const double extra_deviation = std::max(0.0, guide_deviation - base);
+    const double raw = base + dynamic_clearance_gain_ * extra_deviation;
+    const double bounded = clampDouble(raw, lower, cap);
+
+    const double prev = dynamic_clearance_prev_[ctrl_pt_id];
+    const double prev_valid = std::isfinite(prev) && prev > 1e-6 ? prev : base;
+    const double filtered =
+        dynamic_clearance_filter_alpha_ * prev_valid +
+        (1.0 - dynamic_clearance_filter_alpha_) * bounded;
+
+    const double sf = clampDouble(filtered, lower, cap);
+    dynamic_clearance_prev_[ctrl_pt_id] = sf;
+    recordDynamicClearanceStat(sf, false);
+
+    if (dynamic_clearance_debug_)
+    {
+      ROS_INFO_THROTTLE(0.5,
+                        "[DynamicSF] cp=%d guide_dev=%.3f base=%.3f raw=%.3f sf=%.3f cap=%.3f",
+                        ctrl_pt_id, guide_deviation, base, raw, sf, cap);
+    }
+
+    return sf;
   }
 
   void BsplineOptimizer::setEnvironment(const GridMap::Ptr &map)
@@ -388,7 +733,7 @@ namespace ego_planner
             cpsOneSample.points.col(cp_id) = RichInfoSegs[seg_id].first.points.col(cp_of_seg_id);
             cpsOneSample.base_point[cp_id] = RichInfoSegs[seg_id].first.base_point[cp_of_seg_id];
             cpsOneSample.direction[cp_id] = RichInfoSegs[seg_id].first.direction[cp_of_seg_id];
-            //新增
+            //鏂板
             cpsOneSample.local_clearance[cp_id] = RichInfoSegs[seg_id].first.local_clearance[cp_of_seg_id];
             cp_of_seg_id++;
           }
@@ -399,8 +744,7 @@ namespace ego_planner
               cpsOneSample.points.col(cp_id) = RichInfoSegs[seg_id].second.points.col(cp_of_seg_id);
               cpsOneSample.base_point[cp_id] = RichInfoSegs[seg_id].second.base_point[cp_of_seg_id];
               cpsOneSample.direction[cp_id] = RichInfoSegs[seg_id].second.direction[cp_of_seg_id];
-              cpsOneSample.local_clearance[cp_id] = RichInfoSegs[seg_id].second.local_clearance[cp_of_seg_id];//新
-              cp_of_seg_id++;
+              cpsOneSample.local_clearance[cp_id] = RichInfoSegs[seg_id].second.local_clearance[cp_of_seg_id];//鏂?              cp_of_seg_id++;
             }
             else
             {
@@ -437,19 +781,28 @@ namespace ego_planner
    * But I will merge then someday.*/
   std::vector<std::pair<int, int>> BsplineOptimizer::initControlPoints(Eigen::MatrixXd &init_points, bool flag_first_init /*= true*/)
   {
+    last_frontend_failed_ = false;
+    last_frontend_fail_reason_ = "NONE";
+    last_guide_path_count_ = 0;
+    last_guide_invalid_count_ = 0;
 
     if (flag_first_init)
     {
       cps_.clearance = dist0_;
       cps_.resize(init_points.cols());
       cps_.points = init_points;
+      resetDynamicClearanceRuntime(cps_.size);
+    }
+    else if (static_cast<int>(dynamic_clearance_prev_.size()) != cps_.size)
+    {
+      resetDynamicClearanceRuntime(cps_.size);
     }
 
     /*** Segment the initial trajectory according to obstacles ***/
     constexpr int ENOUGH_INTERVAL = 2;
     double step_size = grid_map_->getResolution() / ((init_points.col(0) - init_points.rightCols(1)).norm() / (init_points.cols() - 1)) / 1.5;
     int in_id = -1, out_id = -1;
-    init_collision_pts_ = 0; // 清零
+    init_collision_pts_ = 0; // 娓呴浂
     vector<std::pair<int, int>> segment_ids;
     int same_occ_state_times = ENOUGH_INTERVAL + 1;
     bool occ, last_occ = false;
@@ -516,19 +869,34 @@ namespace ego_planner
       return blank_ret;
     }
 
-    /*** a star search ***/
+    /*** a star search + guide path validation ***/
     vector<vector<Eigen::Vector3d>> a_star_pathes;
+    a_star_pathes.reserve(segment_ids.size());
+
     for (size_t i = 0; i < segment_ids.size(); ++i)
     {
-      //cout << "in=" << in.transpose() << " out=" << out.transpose() << endl;
-      Eigen::Vector3d in(init_points.col(segment_ids[i].first)), out(init_points.col(segment_ids[i].second));
-      if (a_star_->AstarSearch(/*(in-out).norm()/10+0.05*/ 0.1, in, out))
+      Eigen::Vector3d in(init_points.col(segment_ids[i].first));
+      Eigen::Vector3d out(init_points.col(segment_ids[i].second));
+
+      std::vector<Eigen::Vector3d> guide_path;
+      std::string fail_reason;
+
+      if (buildGuidePathForSegment(in, out, guide_path, fail_reason))
       {
-        a_star_pathes.push_back(a_star_->getPath());
+        a_star_pathes.push_back(guide_path);
+        ++last_guide_path_count_;
       }
       else
       {
-        ROS_ERROR("a star error, force return!");
+        ++last_guide_invalid_count_;
+        last_frontend_failed_ = true;
+        last_frontend_fail_reason_ = fail_reason;
+
+        ROS_ERROR_THROTTLE(0.5,
+                           "[BsplineOptimizer] initControlPoints guide path failed. seg=%zu/%zu, reason=%s, in=(%.2f %.2f %.2f), out=(%.2f %.2f %.2f)",
+                           i, segment_ids.size(), fail_reason.c_str(),
+                           in.x(), in.y(), in.z(), out.x(), out.y(), out.z());
+
         vector<std::pair<int, int>> blank_ret;
         return blank_ret;
       }
@@ -633,6 +1001,11 @@ namespace ego_planner
           else
             ++Astar_id;
 
+          if (Astar_id < 0 || Astar_id >= (int)a_star_pathes[i].size())
+          {
+            break;
+          }
+
           val = (a_star_pathes[i][Astar_id] - init_points.col(j)).dot(ctrl_pts_law);
 
           if (val * last_val <= 0 && (abs(val) > 0 || abs(last_val) > 0)) // val = last_val = 0.0 is not allowed
@@ -665,19 +1038,21 @@ namespace ego_planner
                 if (occ)
                   a += grid_map_->getResolution();
                 Eigen::Vector3d base_pt = (a / length) * intersection_point + (1 - a / length) * init_points.col(j);
+                Eigen::Vector3d dir = (intersection_point - init_points.col(j)).normalized();
+                if (!isValidDirectionAndBase(base_pt, dir))
+                {
+                  ROS_WARN("[BsplineOptimizer] invalid base/direction in initControlPoints, j=%d", j);
+                  continue;
+                }
                 //cps_.base_point[j].push_back((a / length) * intersection_point + (1 - a / length) * init_points.col(j));
 
                 cps_.base_point[j].push_back(base_pt);
 
-                cps_.direction[j].push_back((intersection_point - init_points.col(j)).normalized());
+                cps_.direction[j].push_back(dir);
                 // cout << "A " << j << endl;
 
-                // 🚀 新增：计算动态安全阈值
-                double d_center = (intersection_point - base_pt).norm();
-                // α = 0.8, 确保阈值不低于原版 clearance，最高推至引导线 80% 处
-                //double sf_local = std::max(cps_.clearance, 0.8 * d_center); 
-                double max_sf_limit = cps_.clearance * 1.5; // 假设 clearance 是 0.3，则上限为 0.45m
-                double sf_local = std::max(cps_.clearance, std::min(max_sf_limit, 0.5 * d_center)); 
+                const double guide_deviation = (intersection_point - base_pt).norm();
+                const double sf_local = computeLocalClearanceThreshold(guide_deviation, j);
                 cps_.local_clearance[j].push_back(sf_local);
 
                 break;
@@ -707,6 +1082,11 @@ namespace ego_planner
           else
             ++Astar_id;
 
+          if (Astar_id < 0 || Astar_id >= (int)a_star_pathes[i].size())
+          {
+            break;
+          }
+
           val = (a_star_pathes[i][Astar_id] - middle_point).dot(ctrl_pts_law);
 
           if (val * last_val <= 0 && (abs(val) > 0 || abs(last_val) > 0)) // val = last_val = 0.0 is not allowed
@@ -719,19 +1099,24 @@ namespace ego_planner
 
             if ((intersection_point - middle_point).norm() > 0.01) // 1cm.
             {
-              cps_.flag_temp[segment_ids[i].first] = true;
-              cps_.base_point[segment_ids[i].first].push_back(init_points.col(segment_ids[i].first));// 🚀 新增
-              cps_.direction[segment_ids[i].first].push_back((intersection_point - middle_point).normalized());
+              const int cp_id = segment_ids[i].first;
+              cps_.flag_temp[cp_id] = true;
+              Eigen::Vector3d base_pt = init_points.col(cp_id);
+              Eigen::Vector3d dir = (intersection_point - middle_point).normalized();
+              if (!isValidDirectionAndBase(base_pt, dir))
+              {
+                ROS_WARN("[BsplineOptimizer] invalid base/direction in initControlPoints corner case, j=%d", cp_id);
+                break;
+              }
+              cps_.base_point[cp_id].push_back(base_pt);
+              cps_.direction[cp_id].push_back(dir);
 
-              // 🚀 新增：计算单控制点 Corner Case 的动态安全阈值
-          double d_center = (intersection_point - init_points.col(segment_ids[i].first)).norm();
-          //double sf_local = std::max(cps_.clearance, 0.8 * d_center);
-          double max_sf_limit = cps_.clearance * 1.5; // 假设 clearance 是 0.3，则上限为 0.45m
-          double sf_local = std::max(cps_.clearance, std::min(max_sf_limit, 0.5 * d_center)); 
-          cps_.local_clearance[segment_ids[i].first].push_back(sf_local);
+              const double guide_deviation = (intersection_point - base_pt).norm();
+              const double sf_local = computeLocalClearanceThreshold(guide_deviation, cp_id);
+              cps_.local_clearance[cp_id].push_back(sf_local);
 
 
-              got_intersection_id = segment_ids[i].first;
+              got_intersection_id = cp_id;
             }
             break;
           }
@@ -747,7 +1132,7 @@ namespace ego_planner
             cps_.base_point[j].push_back(cps_.base_point[j - 1].back());
             cps_.direction[j].push_back(cps_.direction[j - 1].back());
             // cout << "AAA " << j << endl;
-            cps_.local_clearance[j].push_back(cps_.local_clearance[j - 1].back()); // 🚀 新增
+            cps_.local_clearance[j].push_back(cps_.local_clearance[j - 1].back()); // 馃殌 鏂板
           }
 
         for (int j = got_intersection_id - 1; j >= adjusted_segment_ids[i].first; --j)
@@ -756,7 +1141,7 @@ namespace ego_planner
             cps_.base_point[j].push_back(cps_.base_point[j + 1].back());
             cps_.direction[j].push_back(cps_.direction[j + 1].back());
             // cout << "AAAA " << j << endl;
-             cps_.local_clearance[j].push_back(cps_.local_clearance[j + 1].back()); // 🚀 新增
+             cps_.local_clearance[j].push_back(cps_.local_clearance[j + 1].back()); // 馃殌 鏂板
           }
 
         final_segment_ids.push_back(adjusted_segment_ids[i]);
@@ -768,7 +1153,7 @@ namespace ego_planner
       }
     }
     for (size_t i = 0; i < final_segment_ids.size(); i++) {
-        // 计算每段陷入障碍物的控制点个数并累加
+        // 璁＄畻姣忔闄峰叆闅滅鐗╃殑鎺у埗鐐逛釜鏁板苟绱姞
         init_collision_pts_ += (final_segment_ids[i].second - final_segment_ids[i].first + 1);
     }
     return final_segment_ids;
@@ -898,13 +1283,8 @@ namespace ego_planner
     cost = 0.0;
     int end_idx = q.cols() - order_;
 
-
-    // 🚀 移除原来的全局常量定义
-    //double demarcation = cps_.clearance;
-    //double a = 3 * demarcation, b = -3 * pow(demarcation, 2), c = pow(demarcation, 3);
-
     force_stop_type_ = DONT_STOP;
-    if (iter_num > 3 && smoothness_cost / (cps_.size - 2 * order_) < 0.1) // 0.1 is an experimental value that indicates the trajectory is smooth enough.
+    if (iter_num > 3 && smoothness_cost / (cps_.size - 2 * order_) < 0.1)
     {
       check_collision_and_rebound();
     }
@@ -912,52 +1292,46 @@ namespace ego_planner
     /*** calculate distance cost and gradient ***/
     for (auto i = order_; i < end_idx; ++i)
     {
-      for (size_t j = 0; j < cps_.direction[i].size(); ++j)
-      {
-        /*暂时删除
-        double dist = (cps_.points.col(i) - cps_.base_point[i][j]).dot(cps_.direction[i][j]);
-        double dist_err = cps_.clearance - dist;
-        Eigen::Vector3d dist_grad = cps_.direction[i][j];
+      const size_t obs_num = std::min(cps_.base_point[i].size(), cps_.direction[i].size());
 
-        if (dist_err < 0)
+      for (size_t j = 0; j < obs_num; ++j)
+      {
+        if (!isValidDirectionAndBase(cps_.base_point[i][j], cps_.direction[i][j]))
         {
-         //do nothing
+          continue;
         }
-        else if (dist_err < demarcation)
+
+        double sf_local = cps_.clearance;
+
+        if (enable_dynamic_clearance_ &&
+            i < static_cast<int>(cps_.local_clearance.size()) &&
+            j < cps_.local_clearance[i].size())
         {
-          cost += pow(dist_err, 3);
+          sf_local = sanitizeLocalClearance(cps_.local_clearance[i][j]);
+        }
+
+        const double a = 3.0 * sf_local;
+        const double b = -3.0 * sf_local * sf_local;
+        const double c = sf_local * sf_local * sf_local;
+
+        const double dist = (cps_.points.col(i) - cps_.base_point[i][j]).dot(cps_.direction[i][j]);
+        const double dist_err = sf_local - dist;
+        const Eigen::Vector3d dist_grad = cps_.direction[i][j];
+
+        if (dist_err < 0.0)
+        {
+          continue;
+        }
+        else if (dist_err < sf_local)
+        {
+          cost += std::pow(dist_err, 3);
           gradient.col(i) += -3.0 * dist_err * dist_err * dist_grad;
         }
         else
         {
           cost += a * dist_err * dist_err + b * dist_err + c;
           gradient.col(i) += -(2.0 * a * dist_err + b) * dist_grad;
-        }*/
-        // 🚀 新增：为每一个控制点提取局部安全阈值，并实时计算分段函数的平滑系数 a, b, c
-      double sf_local = cps_.local_clearance[i][j];
-      double a = 3 * sf_local;
-      double b = -3 * sf_local * sf_local;
-      double c = sf_local * sf_local * sf_local;
-
-      double dist = (cps_.points.col(i) - cps_.base_point[i][j]).dot(cps_.direction[i][j]);
-      // 🚀 修改：将全局 cps_.clearance 替换为 sf_local
-      double dist_err = sf_local - dist; 
-      Eigen::Vector3d dist_grad = cps_.direction[i][j];
-
-      if (dist_err < 0)
-      {
-        /* do nothing (处于安全阈值之外) */
-      }
-      else if (dist_err < sf_local) // 🚀 修改：使用 sf_local 作为分界点
-      {
-        cost += pow(dist_err, 3);
-        gradient.col(i) += -3.0 * dist_err * dist_err * dist_grad;
-      }
-      else // 严重侵入障碍物，使用二次函数平滑过渡惩罚
-      {
-        cost += a * dist_err * dist_err + b * dist_err + c;
-        gradient.col(i) += -(2.0 * a * dist_err + b) * dist_grad;
-      }
+        }
       }
     }
   }
@@ -969,7 +1343,7 @@ namespace ego_planner
 
     int end_idx = q.cols() - order_;
 
-    // def: f = |x*v|^2/a^2 + |x×v|^2/b^2
+    // def: f = |x*v|^2/a^2 + |x脳v|^2/b^2
     double a2 = 25, b2 = 1;
     for (auto i = order_ - 1; i < end_idx + 1; ++i)
     {
@@ -1316,7 +1690,8 @@ namespace ego_planner
         }
         if (j >= cps_.size) // fail to get the obs free point
         {
-          ROS_WARN("WARN! terminal point of the current trajectory is in obstacle, skip this planning.");
+          ROS_WARN_THROTTLE(0.5,
+                            "[BsplineOptimizer] terminal control point is in inflated obstacle. Reject this candidate.");
 
           force_stop_type_ = STOP_FOR_ERROR;
           return false;
@@ -1335,16 +1710,40 @@ namespace ego_planner
       {
         /*** a star search ***/
         Eigen::Vector3d in(cps_.points.col(segment_ids[i].first)), out(cps_.points.col(segment_ids[i].second));
-        if (a_star_->AstarSearch(/*(in-out).norm()/10+0.05*/ 0.1, in, out))
+        std::vector<Eigen::Vector3d> guide_path;
+        std::string fail_reason;
+
+        if (buildGuidePathForSegment(in, out, guide_path, fail_reason))
         {
-          a_star_pathes.push_back(a_star_->getPath());
+          a_star_pathes.push_back(guide_path);
+          ++last_guide_path_count_;
         }
         else
         {
-          ROS_ERROR("a star error");
+          ++last_guide_invalid_count_;
+          last_frontend_failed_ = true;
+          last_frontend_fail_reason_ = fail_reason;
+          ROS_WARN_THROTTLE(0.5,
+                            "[BsplineOptimizer] rebound guide path rejected for this candidate. seg=%zu/%zu, reason=%s",
+                            i, segment_ids.size(), fail_reason.c_str());
           segment_ids.erase(segment_ids.begin() + i);
           i--;
         }
+      }
+
+      if (segment_ids.empty())
+      {
+        ROS_WARN_THROTTLE(0.5,
+                          "[BsplineOptimizer] all rebound guide paths failed for this candidate. Reject this candidate.");
+        force_stop_type_ = STOP_FOR_ERROR;
+        return false;
+      }
+
+      if (a_star_pathes.size() != segment_ids.size())
+      {
+        ROS_ERROR("[BsplineOptimizer] guide path size mismatch. paths=%zu, segments=%zu", a_star_pathes.size(), segment_ids.size());
+        force_stop_type_ = STOP_FOR_ERROR;
+        return false;
       }
 
       for (size_t i = 1; i < segment_ids.size(); i++) // Avoid overlap
@@ -1379,6 +1778,11 @@ namespace ego_planner
               --Astar_id;
             else
               ++Astar_id;
+
+            if (Astar_id < 0 || Astar_id >= (int)a_star_pathes[i].size())
+            {
+              break;
+            }
 
             val = (a_star_pathes[i][Astar_id] - cps_.points.col(j)).dot(ctrl_pts_law);
 
@@ -1415,15 +1819,18 @@ namespace ego_planner
                   //here!!!!
                   
                   Eigen::Vector3d base_pt = (a / length) * intersection_point + (1 - a / length) * cps_.points.col(j);
+                  Eigen::Vector3d dir = (intersection_point - cps_.points.col(j)).normalized();
+                  if (!isValidDirectionAndBase(base_pt, dir))
+                  {
+                    ROS_WARN("[BsplineOptimizer] invalid base/direction in check_collision_and_rebound, j=%d", j);
+                    continue;
+                  }
                   cps_.base_point[j].push_back(base_pt);
                   //cps_.base_point[j].push_back((a / length) * intersection_point + (1 - a / length) * cps_.points.col(j));
-                  cps_.direction[j].push_back((intersection_point - cps_.points.col(j)).normalized());
+                  cps_.direction[j].push_back(dir);
 
-                  // 🚀 新增：计算动态安全阈值
-                  double d_center = (intersection_point - base_pt).norm();
-                  //double sf_local = std::max(cps_.clearance, 0.8 * d_center); 
-                  double max_sf_limit = cps_.clearance * 1.5; // 假设 clearance 是 0.3，则上限为 0.45m
-          double sf_local = std::max(cps_.clearance, std::min(max_sf_limit, 0.5 * d_center)); 
+                  const double guide_deviation = (intersection_point - base_pt).norm();
+                  const double sf_local = computeLocalClearanceThreshold(guide_deviation, j);
                   cps_.local_clearance[j].push_back(sf_local);
 
                   break;

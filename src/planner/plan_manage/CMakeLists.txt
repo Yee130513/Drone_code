@@ -13,6 +13,7 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   std_msgs
   geometry_msgs
+  visualization_msgs
   quadrotor_msgs
   plan_env
   path_searching
@@ -53,4 +54,11 @@ add_executable(traj_server src/traj_server.cpp)
 target_link_libraries(traj_server ${catkin_LIBRARIES})
 #add_dependencies(traj_server ${${PROJECT_NAME}_EXPORTED_TARGETS})
 
+add_executable(start_goal_marker_node
+  src/start_goal_marker_node.cpp
+)
+
+target_link_libraries(start_goal_marker_node
+  ${catkin_LIBRARIES}
+)
 
