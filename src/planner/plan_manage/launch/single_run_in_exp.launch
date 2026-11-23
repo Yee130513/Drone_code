@@ -7,19 +7,19 @@
     <!-- Experiment switches                                        -->
     <!-- ========================================================= -->
 
-    <!-- Planner front-end -->
-    <arg name="planner_type" value="SCA_ASTAR"/>
+    <!-- Planner front-end: "SCA_ASTAR" (dyn_a_star_sca) or "A_STAR" (dyn_a_star_a) -->
+    <arg name="planner_type" default="SCA_ASTAR"/>
 
     <!-- Planner-side time allocation.
          必须保持 Global，作为 traj_server 执行层 EVTR 的安全下界。 -->
-    <arg name="planner_time_allocation_method" value="Global"/>
+    <arg name="planner_time_allocation_method" default="Global"/>
 
     <!-- Backend dynamic safety threshold, default OFF for real flight -->
-    <arg name="enable_dynamic_clearance" value="false"/>
+    <arg name="enable_dynamic_clearance" default="false"/>
 
     <!-- Execution-layer virtual time remapping, default OFF for first flight -->
-    <arg name="enable_exec_time_remap" value="false"/>
-    <arg name="exec_time_remap_mode" value="OFF"/>
+    <arg name="enable_exec_time_remap" default="false"/>
+    <arg name="exec_time_remap_mode" default="OFF"/>
 
     <arg name="map_size_x" value="13"/>
     <arg name="map_size_y" value="13"/>

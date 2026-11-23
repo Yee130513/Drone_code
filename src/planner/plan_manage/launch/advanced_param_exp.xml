@@ -17,6 +17,10 @@
   <arg name="max_acc"/>
   <arg name="planning_horizon"/>
 
+  <arg name="planner_type" default="SCA_ASTAR"/>
+  <arg name="planner_time_allocation_method" default="Global"/>
+  <arg name="enable_dynamic_clearance" default="false"/>
+
   <arg name="point_num"/>
   <arg name="point0_x"/>
   <arg name="point0_y"/>

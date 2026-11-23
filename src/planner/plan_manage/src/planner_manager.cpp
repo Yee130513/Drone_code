@@ -49,6 +49,7 @@ namespace ego_planner
     //bspline_optimizer_->a_star_.reset(new ThetaStar);
     //bspline_optimizer_->a_star_.reset(new JPSThetaPlanner);
     bspline_optimizer_->a_star_.reset(new AStar);
+    bspline_optimizer_->a_star_->setPlannerType(planner_type_);
     bspline_optimizer_->a_star_->initGridMap(grid_map_, Eigen::Vector3i(100, 100, 100));
 
     visualization_ = vis;

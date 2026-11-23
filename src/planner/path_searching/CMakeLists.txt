@@ -35,7 +35,8 @@ include_directories(
 )
 
 add_library( path_searching 
-    src/dyn_a_star.cpp
+    src/dyn_a_star_sca.cpp
+    src/dyn_a_star_a.cpp
     #src/theta_star.cpp
     #src/jps_theta_planner.cpp
     )

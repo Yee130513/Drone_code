@@ -1,18 +1,27 @@
-#include "path_searching/dyn_a_star.h"
+#include "path_searching/dyn_a_star_a.h"
 
 using namespace std;
 using namespace Eigen;
 
-AStar::~AStar()
+AStarA::~AStarA()
 {
+    if (GridNodeMap_ == nullptr)
+        return;
+
     for (int i = 0; i < POOL_SIZE_(0); i++)
         for (int j = 0; j < POOL_SIZE_(1); j++)
             for (int k = 0; k < POOL_SIZE_(2); k++)
                 delete GridNodeMap_[i][j][k];
 }
 
-void AStar::initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size)
+void AStarA::initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size)
 {
+    if (GridNodeMap_ != nullptr)
+    {
+        grid_map_ = occ_map;
+        return;
+    }
+
     POOL_SIZE_ = pool_size;
     CENTER_IDX_ = pool_size / 2;
 
@@ -33,7 +42,7 @@ void AStar::initGridMap(GridMap::Ptr occ_map, const Eigen::Vector3i pool_size)
     grid_map_ = occ_map;
 }
 
-double AStar::getDiagHeu(GridNodePtr node1, GridNodePtr node2)
+double AStarA::getDiagHeu(GridNodePtr node1, GridNodePtr node2)
 {
     double dx = abs(node1->index(0) - node2->index(0));
     double dy = abs(node1->index(1) - node2->index(1));
@@ -60,7 +69,7 @@ double AStar::getDiagHeu(GridNodePtr node1, GridNodePtr node2)
     return h;
 }
 
-double AStar::getManhHeu(GridNodePtr node1, GridNodePtr node2)
+double AStarA::getManhHeu(GridNodePtr node1, GridNodePtr node2)
 {
     double dx = abs(node1->index(0) - node2->index(0));
     double dy = abs(node1->index(1) - node2->index(1));
@@ -69,12 +78,12 @@ double AStar::getManhHeu(GridNodePtr node1, GridNodePtr node2)
     return dx + dy + dz;
 }
 
-double AStar::getEuclHeu(GridNodePtr node1, GridNodePtr node2)
+double AStarA::getEuclHeu(GridNodePtr node1, GridNodePtr node2)
 {
     return (node2->index - node1->index).norm();
 }
 
-vector<GridNodePtr> AStar::retrievePath(GridNodePtr current)
+vector<GridNodePtr> AStarA::retrievePath(GridNodePtr current)
 {
     vector<GridNodePtr> path;
     path.push_back(current);
@@ -88,7 +97,7 @@ vector<GridNodePtr> AStar::retrievePath(GridNodePtr current)
     return path;
 }
 
-double AStar::computePathLength(const std::vector<Eigen::Vector3d> &path) const
+double AStarA::computePathLength(const std::vector<Eigen::Vector3d> &path) const
 {
     if (path.size() < 2)
     {
@@ -104,7 +113,7 @@ double AStar::computePathLength(const std::vector<Eigen::Vector3d> &path) const
     return length;
 }
 
-double AStar::estimateClearanceMetricOnly(const Eigen::Vector3d &pt)
+double AStarA::estimateClearanceMetricOnly(const Eigen::Vector3d &pt)
 {
     if (grid_map_ == nullptr)
     {
@@ -153,10 +162,10 @@ double AStar::estimateClearanceMetricOnly(const Eigen::Vector3d &pt)
     return (max_probe_steps_ + 1) * res;
 }
 
-bool AStar::segmentFreeSampledMetricOnly(const Eigen::Vector3d &p1,
-                                         const Eigen::Vector3d &p2,
-                                         bool ignore_start_occupancy,
-                                         bool ignore_end_occupancy)
+bool AStarA::segmentFreeSampledMetricOnly(const Eigen::Vector3d &p1,
+                                          const Eigen::Vector3d &p2,
+                                          bool ignore_start_occupancy,
+                                          bool ignore_end_occupancy)
 {
     if (grid_map_ == nullptr)
     {
@@ -210,7 +219,7 @@ bool AStar::segmentFreeSampledMetricOnly(const Eigen::Vector3d &p1,
     return true;
 }
 
-void AStar::updatePathMetricsFromPath(const std::vector<Eigen::Vector3d> &path)
+void AStarA::updatePathMetricsFromPath(const std::vector<Eigen::Vector3d> &path)
 {
     last_min_clearance_ = 0.0;
     path_length_ = 0.0;
@@ -258,7 +267,7 @@ void AStar::updatePathMetricsFromPath(const std::vector<Eigen::Vector3d> &path)
     segment_check_fail_count_ = edge_reject_count_ + output_edge_fail_count_;
 }
 
-void AStar::updatePathMetricsFromGridPath()
+void AStarA::updatePathMetricsFromGridPath()
 {
     std::vector<Eigen::Vector3d> path;
     path.reserve(gridPath_.size());
@@ -276,7 +285,7 @@ void AStar::updatePathMetricsFromGridPath()
     updatePathMetricsFromPath(path);
 }
 
-std::vector<Eigen::Vector3d> AStar::buildFinalPathFromGridPath() const
+std::vector<Eigen::Vector3d> AStarA::buildFinalPathFromGridPath() const
 {
     std::vector<Eigen::Vector3d> path;
 
@@ -298,6 +307,7 @@ std::vector<Eigen::Vector3d> AStar::buildFinalPathFromGridPath() const
     }
 
     std::reverse(grid_centers.begin(), grid_centers.end());
+
     for (const auto &p : grid_centers)
     {
         if (path.empty() || (p - path.back()).norm() > 1e-4)
@@ -314,8 +324,8 @@ std::vector<Eigen::Vector3d> AStar::buildFinalPathFromGridPath() const
     return path;
 }
 
-bool AStar::validateFinalPathAndUpdateMetrics(const std::vector<Eigen::Vector3d> &path,
-                                              std::string *reason)
+bool AStarA::validateFinalPathAndUpdateMetrics(const std::vector<Eigen::Vector3d> &path,
+                                               std::string *reason)
 {
     path_length_ = 0.0;
     last_min_clearance_ = 0.0;
@@ -417,12 +427,12 @@ bool AStar::validateFinalPathAndUpdateMetrics(const std::vector<Eigen::Vector3d>
     return true;
 }
 
-bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt,
-                                                  Vector3d end_pt,
-                                                  Vector3i &start_idx,
-                                                  Vector3i &end_idx,
-                                                  Vector3d *adjusted_start_pt,
-                                                  Vector3d *adjusted_end_pt)
+bool AStarA::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt,
+                                                   Vector3d end_pt,
+                                                   Vector3i &start_idx,
+                                                   Vector3i &end_idx,
+                                                   Vector3d *adjusted_start_pt,
+                                                   Vector3d *adjusted_end_pt)
 {
     if (!Coord2Index(start_pt, start_idx) || !Coord2Index(end_pt, end_idx))
         return false;
@@ -461,7 +471,7 @@ bool AStar::ConvertToIndexAndAdjustStartEndPoints(Vector3d start_pt,
     return true;
 }
 
-bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_pt)
+bool AStarA::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_pt)
 {
     ros::Time time_1 = ros::Time::now();
 
@@ -677,7 +687,7 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
     return finishSearch(false);
 }
 
-vector<Vector3d> AStar::getPath()
+vector<Vector3d> AStarA::getPath()
 {
     if (!final_path_.empty())
     {
