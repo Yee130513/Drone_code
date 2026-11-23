@@ -4,6 +4,7 @@
 #include "quadrotor_msgs/PositionCommand.h"
 #include "std_msgs/Empty.h"
 #include "visualization_msgs/Marker.h"
+#include <geometry_msgs/Vector3Stamped.h>
 #include <ros/ros.h>
 #include <cmath>
 #include <fstream>
@@ -12,6 +13,8 @@
 #include <string>
 
 ros::Publisher pos_cmd_pub;
+ros::Publisher evtr_state_pub;
+int drone_id_ = 0;
 
 quadrotor_msgs::PositionCommand cmd;
 double pos_gain[3] = {0, 0, 0};
@@ -64,6 +67,17 @@ double evtr_eps_acc_ = 1e-3;
 
 bool enable_alpha_dot_acc_ = true;
 
+// P2: Closed-loop Tracking Error Gate (primarily for real-flight disturbance protection)
+bool enable_tracking_gate_ = false;
+double tracking_error_soft_ = 0.20;
+double tracking_error_hard_ = 0.45;
+bool have_odom_ = false;
+Eigen::Vector3d odom_pos_ = Eigen::Vector3d::Zero();
+ros::Time odom_stamp_;
+
+// P2: Persistent file stream to avoid open/close I/O jitter in 100 Hz cmdCallback
+std::ofstream real_flight_log_stream_;
+
 bool evtr_fallback_this_cycle_ = false;
 std::string evtr_fallback_reason_ = "none";
 int evtr_fallback_count_ = 0;
@@ -71,6 +85,15 @@ int evtr_fallback_count_ = 0;
 bool is_flight_started_ = false;
 ros::Time start_flight_time_;
 // ==========================================================
+
+void odomCallback(const nav_msgs::OdometryConstPtr &msg)
+{
+  odom_pos_(0) = msg->pose.pose.position.x;
+  odom_pos_(1) = msg->pose.pose.position.y;
+  odom_pos_(2) = msg->pose.pose.position.z;
+  odom_stamp_ = msg->header.stamp.isZero() ? ros::Time::now() : msg->header.stamp;
+  have_odom_ = std::isfinite(odom_pos_(0)) && std::isfinite(odom_pos_(1)) && std::isfinite(odom_pos_(2));
+}
 
 void bsplineCallback(traj_utils::BsplineConstPtr msg)
 {
@@ -236,8 +259,9 @@ bool computeLookaheadAlpha(double s_now, double &alpha_allow, std::string &reaso
   }
 
   const int sample_count = std::max(1, evtr_lookahead_samples_);
-  const double horizon = std::max(0.0, evtr_lookahead_time_);
-  double alpha_min_window = alpha_max_;
+  // Scale parameter lookahead horizon by current progression rate so physical lookahead time >= H
+  const double horizon = std::max(0.0, evtr_lookahead_time_) * std::max(1.0, alpha_prev_);
+  double alpha_min_window = 1e9;
 
   for (int k = 0; k <= sample_count; ++k)
   {
@@ -262,7 +286,7 @@ bool computeLookaheadAlpha(double s_now, double &alpha_allow, std::string &reaso
     alpha_min_window = std::min(alpha_min_window, alpha_local);
   }
 
-  alpha_allow = alpha_safety_ratio_ * alpha_min_window;
+  alpha_allow = std::min(alpha_max_, alpha_safety_ratio_ * alpha_min_window);
   reason = "none";
   return std::isfinite(alpha_allow);
 }
@@ -297,9 +321,11 @@ void cmdCallback(const ros::TimerEvent &e)
 
   if (traj_id_ != last_traj_id_)
   {
+    // New replanned trajectory already starts from the executed (pos, alpha*vel, alpha^2*acc)
+    // via evtr_state feedback, so resetting s_virtual_=0 and alpha_prev_=1.0 ensures smooth handover.
     s_virtual_ = 0.0;
-    alpha_prev_ = std::min(alpha_prev_, 1.0);
-    alpha_curr_ = alpha_prev_;
+    alpha_prev_ = 1.0;
+    alpha_curr_ = 1.0;
     alpha_dot_ = 0.0;
     last_traj_id_ = traj_id_;
   }
@@ -317,10 +343,45 @@ void cmdCallback(const ros::TimerEvent &e)
 
     if (computeLookaheadAlpha(s_virtual_, alpha_allow, reason))
     {
+      // P2: Closed-loop Tracking Error Gate (suppresses alpha when real drone lags behind reference)
+      if (enable_tracking_gate_ && have_odom_ && traj_.size() >= 1)
+      {
+        const double odom_age = (time_now - odom_stamp_).toSec();
+        if (odom_age >= -0.05 && odom_age < 0.25)
+        {
+          const Eigen::Vector3d ref_pos_now = traj_[0].evaluateDeBoorT(safeEvalTime(s_virtual_));
+          const double track_err = (odom_pos_ - ref_pos_now).norm();
+          if (track_err >= tracking_error_hard_)
+          {
+            alpha_allow = std::min(alpha_allow, alpha_min_);
+          }
+          else if (track_err > tracking_error_soft_)
+          {
+            const double span = std::max(1e-3, tracking_error_hard_ - tracking_error_soft_);
+            const double ratio = clampDouble((tracking_error_hard_ - track_err) / span, 0.0, 1.0);
+            const double alpha_gate_cap = alpha_min_ + ratio * (alpha_max_ - alpha_min_);
+            alpha_allow = std::min(alpha_allow, alpha_gate_cap);
+          }
+        }
+      }
+
       const double alpha_raw = clampDouble(alpha_allow, alpha_min_, alpha_max_);
       alpha_curr_ = rateLimitAlpha(alpha_raw, alpha_prev_, dt);
       alpha_curr_ = clampDouble(alpha_curr_, alpha_min_, alpha_max_);
       alpha_dot_ = (alpha_curr_ - alpha_prev_) / dt;
+
+      // Analytically bound alpha_dot so ||P'' * alpha^2 + P' * alpha_dot|| <= lambda * max_acc
+      if (enable_alpha_dot_acc_ && traj_.size() >= 3)
+      {
+        const double s_eval = safeEvalTime(s_virtual_);
+        const Eigen::Vector3d p_s_now = traj_[1].evaluateDeBoorT(s_eval);
+        const Eigen::Vector3d p_ss_now = traj_[2].evaluateDeBoorT(s_eval);
+        const double a_rem = std::max(0.0, alpha_safety_ratio_ * max_acc_ - (alpha_curr_ * alpha_curr_) * p_ss_now.norm());
+        const double max_alpha_dot_by_acc = a_rem / (p_s_now.norm() + evtr_eps_vel_);
+        alpha_dot_ = clampDouble(alpha_dot_, -max_alpha_dot_by_acc, max_alpha_dot_by_acc);
+        alpha_curr_ = clampDouble(alpha_prev_ + alpha_dot_ * dt, alpha_min_, alpha_max_);
+        alpha_dot_ = (alpha_curr_ - alpha_prev_) / dt;
+      }
 
       s_virtual_ += 0.5 * (alpha_prev_ + alpha_curr_) * dt;
       s_virtual_ = clampDouble(s_virtual_, 0.0, traj_duration_);
@@ -331,12 +392,14 @@ void cmdCallback(const ros::TimerEvent &e)
     }
     else
     {
+      // Continuous in-place fallback: keep s_virtual_ continuous in space, advance at baseline rate alpha=1
       evtr_fallback_this_cycle_ = true;
       evtr_fallback_reason_ = reason;
       evtr_fallback_count_++;
       alpha = 1.0;
       alpha_dot = 0.0;
-      progress_time = clampDouble(t_cur, 0.0, traj_duration_);
+      s_virtual_ = clampDouble(s_virtual_ + dt, 0.0, traj_duration_);
+      progress_time = s_virtual_;
     }
   }
 
@@ -365,20 +428,19 @@ void cmdCallback(const ros::TimerEvent &e)
       }
     }
 
-    const double acc_guard = std::max(max_acc_ * 2.0, max_acc_ + 1.0);
+    const double acc_guard = std::max(max_acc_ * 1.25, max_acc_ + 0.5);
     if (enable_virtual_time_remap_ && !evtr_fallback_this_cycle_ && acc.norm() > acc_guard)
     {
+      // Continuous in-place protection: never teleport back to t_cur; drop alpha_dot and cap alpha <= 1.0 at s_virtual_
       evtr_fallback_this_cycle_ = true;
       evtr_fallback_reason_ = "acc_cmd_too_large";
       evtr_fallback_count_++;
-      alpha = 1.0;
+      alpha = std::min(alpha_curr_, 1.0);
       alpha_dot = 0.0;
-      progress_time = clampDouble(t_cur, 0.0, traj_duration_);
-
-      const double fallback_s = safeEvalTime(progress_time);
-      pos = traj_[0].evaluateDeBoorT(fallback_s);
-      vel = traj_[1].evaluateDeBoorT(fallback_s);
-      acc = traj_[2].evaluateDeBoorT(fallback_s);
+      alpha_curr_ = alpha;
+      alpha_dot_ = 0.0;
+      vel = p_s * alpha;
+      acc = p_ss * (alpha * alpha);
     }
 
     if (!isFiniteVec(pos) || !isFiniteVec(vel) || !isFiniteVec(acc))
@@ -428,31 +490,29 @@ void cmdCallback(const ros::TimerEvent &e)
   static double last_record_time = 0;
   if (progress_time < traj_duration_ && t_current - last_record_time > 0.1)
   {
-    const char *home_env = getenv("HOME");
-    if (home_env != nullptr)
+    if (real_flight_log_stream_.is_open())
     {
-      std::string home_dir(home_env);
-      std::ofstream real_profile(home_dir + "/.ros/ego_real_flight_log.csv", std::ios::out | std::ios::app);
-      if (real_profile.is_open())
-      {
-        if (real_profile.tellp() == 0)
-        {
-          real_profile << "Real_Time,ProgressTime,Alpha,AlphaDot,Velocity,Acceleration,EVTR_Enable,EVTR_Fallback,FallbackReason\n";
-        }
-        real_profile << t_current << ","
-                     << progress_time << ","
-                     << alpha << ","
-                     << alpha_dot << ","
-                     << vel.norm() << ","
-                     << acc.norm() << ","
-                     << (enable_virtual_time_remap_ ? 1 : 0) << ","
-                     << (evtr_fallback_this_cycle_ ? 1 : 0) << ","
-                     << evtr_fallback_reason_ << "\n";
-        real_profile.close();
-      }
+      real_flight_log_stream_ << t_current << ","
+                              << progress_time << ","
+                              << alpha << ","
+                              << alpha_dot << ","
+                              << vel.norm() << ","
+                              << acc.norm() << ","
+                              << (enable_virtual_time_remap_ ? 1 : 0) << ","
+                              << (evtr_fallback_this_cycle_ ? 1 : 0) << ","
+                              << evtr_fallback_reason_ << "\n";
     }
     last_record_time = t_current;
   }
+
+  // Publish EVTR execution progress for seamless replan handover in ego_replan_fsm
+  geometry_msgs::Vector3Stamped evtr_msg;
+  evtr_msg.header.stamp = time_now;
+  evtr_msg.header.frame_id = "world";
+  evtr_msg.vector.x = progress_time;
+  evtr_msg.vector.y = alpha;
+  evtr_msg.vector.z = static_cast<double>(traj_id_);
+  evtr_state_pub.publish(evtr_msg);
 
   // ---------------- 发送指令 ----------------
   cmd.header.stamp = time_now;
@@ -485,23 +545,57 @@ int main(int argc, char **argv)
   ros::init(argc, argv, "traj_server");
   // ros::NodeHandle node;
   ros::NodeHandle nh("~");
+  nh.param("traj_server/drone_id", drone_id_, 0);
   nh.param("traj_server/enable_virtual_time_remap", enable_virtual_time_remap_, false);
-  nh.param("manager/max_vel", max_vel_, 1.5);
-  nh.param("manager/max_acc", max_acc_, 5.0);
   nh.param("manager/time_scaling_method", time_scaling_method_, std::string("Global"));
 
+  // Prefer canonical traj_server/* parameter names, with fallback to legacy names
+  if (!nh.getParam("traj_server/max_vel", max_vel_))
+    nh.param("manager/max_vel", max_vel_, 1.5);
+  if (!nh.getParam("traj_server/max_acc", max_acc_))
+    nh.param("manager/max_acc", max_acc_, 5.0);
+
   nh.param("traj_server/alpha_min", alpha_min_, 0.4);
-  nh.param("traj_server/alpha_max", alpha_max_, 2.0);
-  nh.param("traj_server/alpha_safety_ratio", alpha_safety_ratio_, 0.90);
+  nh.param("traj_server/alpha_max", alpha_max_, 1.5);
+  if (!nh.getParam("traj_server/dynamic_margin", alpha_safety_ratio_))
+    nh.param("traj_server/alpha_safety_ratio", alpha_safety_ratio_, 0.90);
   nh.param("traj_server/alpha_rate_up", alpha_rate_up_, 1.5);
-  nh.param("traj_server/alpha_rate_down", alpha_rate_down_, 5.0);
-  nh.param("traj_server/evtr_lookahead_time", evtr_lookahead_time_, 0.4);
-  nh.param("traj_server/evtr_lookahead_samples", evtr_lookahead_samples_, 5);
-  nh.param("traj_server/enable_alpha_dot_acc", enable_alpha_dot_acc_, true);
+  nh.param("traj_server/alpha_rate_down", alpha_rate_down_, 4.0);
+  if (!nh.getParam("traj_server/lookahead_time", evtr_lookahead_time_))
+    nh.param("traj_server/evtr_lookahead_time", evtr_lookahead_time_, 0.40);
+  if (!nh.getParam("traj_server/lookahead_samples", evtr_lookahead_samples_))
+    nh.param("traj_server/evtr_lookahead_samples", evtr_lookahead_samples_, 5);
+  if (!nh.getParam("traj_server/use_alpha_dot_acc", enable_alpha_dot_acc_))
+    nh.param("traj_server/enable_alpha_dot_acc", enable_alpha_dot_acc_, true);
+
+  nh.param("traj_server/enable_tracking_gate", enable_tracking_gate_, false);
+  nh.param("traj_server/tracking_error_soft", tracking_error_soft_, 0.20);
+  nh.param("traj_server/tracking_error_hard", tracking_error_hard_, 0.45);
+  if (tracking_error_hard_ <= tracking_error_soft_ + 1e-3)
+    tracking_error_hard_ = tracking_error_soft_ + 0.10;
+
+  // Open persistent flight log stream once to avoid open/close I/O jitter in 100 Hz callback
+  const char *home_env = getenv("HOME");
+  if (home_env != nullptr)
+  {
+    std::string log_path = std::string(home_env) + "/.ros/ego_real_flight_log.csv";
+    real_flight_log_stream_.open(log_path, std::ios::out | std::ios::app);
+    if (real_flight_log_stream_.is_open())
+    {
+      real_flight_log_stream_.seekp(0, std::ios::end);
+      if (real_flight_log_stream_.tellp() == 0)
+      {
+        real_flight_log_stream_ << "Real_Time,ProgressTime,Alpha,AlphaDot,Velocity,Acceleration,EVTR_Enable,EVTR_Fallback,FallbackReason\n";
+      }
+    }
+  }
 
   ros::Subscriber bspline_sub = nh.subscribe("planning/bspline", 10, bsplineCallback);
+  ros::Subscriber odom_sub = nh.subscribe("odom_world", 10, odomCallback, ros::TransportHints().tcpNoDelay());
 
   pos_cmd_pub = nh.advertise<quadrotor_msgs::PositionCommand>("/position_cmd", 50);
+  std::string evtr_topic = std::string("/drone_") + std::to_string(drone_id_) + std::string("_planning/evtr_state");
+  evtr_state_pub = nh.advertise<geometry_msgs::Vector3Stamped>(evtr_topic, 20);
 
   ros::Timer cmd_timer = nh.createTimer(ros::Duration(0.01), cmdCallback);
   
@@ -523,6 +617,12 @@ int main(int argc, char **argv)
   ROS_WARN("[Traj server]: ready.");
 
   ros::spin();
+
+  if (real_flight_log_stream_.is_open())
+  {
+    real_flight_log_stream_.flush();
+    real_flight_log_stream_.close();
+  }
 
   return 0;
 }

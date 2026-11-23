@@ -54,14 +54,14 @@ class AStarSCA
 private:
 	GridMap::Ptr grid_map_;
 
-	/* SCA-A* parameters: conservative defaults for front-end guide path. */
+	/* SCA-A* parameters: balanced with heuristic scale for fast, smooth high-clearance guides. */
 	int expand_step_{2};
 	int dense_expand_step_{1};
 	int max_probe_steps_{3};
 
 	double epsilon_{1.4};
-	double weight_clearance_{0.02};//0.03
-	double weight_turn_{0.02};
+	double weight_clearance_{0.02};
+	double weight_turn_{0.025};
 
 	bool conservative_edge_check_{true};
 	bool reject_unknown_{false};
@@ -95,6 +95,10 @@ private:
 
 	bool lineOfSight(const Eigen::Vector3i &idx1,
 					 const Eigen::Vector3i &idx2);
+
+	bool clearancePreservingLineOfSight(const Eigen::Vector3d &p1,
+										const Eigen::Vector3d &p2,
+										double min_required_clearance);
 
 	double estimateClearance(const Eigen::Vector3d &pt);
 	double getClearanceCost(const Eigen::Vector3d &pt);

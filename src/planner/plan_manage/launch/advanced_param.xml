@@ -176,6 +176,7 @@
     <param name="optimization/guide_validate_resolution_ratio" value="0.50" type="double"/>
 
     <param name="optimization/dynamic_clearance_gain" value="0.25" type="double"/>
+    <param name="optimization/dynamic_clearance_beta" value="0.40" type="double"/>
     <param name="optimization/dynamic_clearance_filter_alpha" value="0.70" type="double"/>
     <param name="optimization/dynamic_clearance_upper_ratio" value="1.20" type="double"/>
     <param name="optimization/dynamic_clearance_lower_ratio" value="1.00" type="double"/>

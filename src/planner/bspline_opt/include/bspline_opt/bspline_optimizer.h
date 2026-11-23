@@ -175,6 +175,7 @@ namespace ego_planner
     // dynamic safe threshold parameters
     // Only affects rebound soft collision cost. It must not change grid_map hard collision checks.
     double dynamic_clearance_gain_{0.25};
+    double dynamic_clearance_beta_{0.40};
     double dynamic_clearance_filter_alpha_{0.70};
     double dynamic_clearance_upper_ratio_{1.20};
     double dynamic_clearance_lower_ratio_{1.00};
@@ -184,6 +185,7 @@ namespace ego_planner
 
     // runtime state for smoothing and logging
     std::vector<double> dynamic_clearance_prev_;
+    std::vector<bool> dynamic_clearance_has_prev_;
     int dynamic_clearance_count_{0};
     int dynamic_clearance_fallback_count_{0};
     double dynamic_clearance_min_{0.0};
@@ -277,7 +279,18 @@ namespace ego_planner
     void resetDynamicClearanceRuntime(int ctrl_pt_num);
     double sanitizeLocalClearance(double sf_local) const;
     void recordDynamicClearanceStat(double sf_local, bool fallback);
+    double estimateGuidePointClearance(const Eigen::Vector3d& guide_pt,
+                                       const Eigen::Vector3d& push_dir) const;
+    double computeLocalClearanceThreshold(double guide_deviation,
+                                          double guide_clearance,
+                                          int ctrl_pt_id);
     double computeLocalClearanceThreshold(double guide_deviation, int ctrl_pt_id);
+    bool matchGuidePointForControlPoint(const std::vector<Eigen::Vector3d>& guide_path,
+                                        const Eigen::Vector3d& ctrl_pt,
+                                        const Eigen::Vector3d& ctrl_pts_law,
+                                        double progress_ratio,
+                                        int& last_matched_idx,
+                                        Eigen::Vector3d& matched_guide_pt) const;
 
     static int earlyExit(void *func_data, const double *x, const double *g, const double fx, const double xnorm, const double gnorm, const double step, int n, int k, int ls);
     static double costFunctionRebound(void *func_data, const double *x, double *grad, const int n);

@@ -215,6 +215,39 @@ bool AStarSCA::lineOfSight(const Eigen::Vector3i &idx1,
     return edgeFeasible(idx1, idx2, true);
 }
 
+bool AStarSCA::clearancePreservingLineOfSight(const Eigen::Vector3d &p1,
+                                              const Eigen::Vector3d &p2,
+                                              double min_required_clearance)
+{
+    if (!segmentFreeSampled(p1, p2))
+    {
+        return false;
+    }
+
+    if (min_required_clearance <= 1e-6 || grid_map_ == nullptr)
+    {
+        return true;
+    }
+
+    const Eigen::Vector3d diff = p2 - p1;
+    const double dist = diff.norm();
+    const double res = grid_map_->getResolution();
+    const double sample_step = std::max(res, 1e-3);
+    const int steps = std::max(1, static_cast<int>(std::ceil(dist / sample_step)));
+
+    for (int i = 1; i < steps; ++i)
+    {
+        const double s = static_cast<double>(i) / static_cast<double>(steps);
+        const Eigen::Vector3d p = p1 + s * diff;
+        if (estimateClearance(p) + 1e-6 < min_required_clearance)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 double AStarSCA::getDiagHeu(GridNodePtr node1, GridNodePtr node2)
 {
     double dx = abs(node1->index(0) - node2->index(0));
@@ -641,16 +674,13 @@ bool AStarSCA::searchOnce(const Eigen::Vector3d &start_pt,
 
                     neighborPtr->rounds = rounds_;
 
-                    double move_cost = std::sqrt(
+                    const double move_cost = std::sqrt(
                         static_cast<double>(dx_i * dx_i + dy_i * dy_i + dz_i * dz_i)) * step_size_;
 
-                    double clearance_cost = 0.0;
-                    double turn_cost = 0.0;
-                    if (use_sca)
-                    {
-                        clearance_cost = weight_clearance_ * getClearanceCost(neighbor_pos);
-                        turn_cost = weight_turn_ * getTurnPenalty(current, neighborIdx);
-                    }
+                    const double clearance_weight = use_sca ? weight_clearance_ : 0.5 * weight_clearance_;
+                    const double turn_weight = use_sca ? weight_turn_ : 0.5 * weight_turn_;
+                    const double clearance_cost = clearance_weight * getClearanceCost(neighbor_pos);
+                    const double turn_cost = turn_weight * getTurnPenalty(current, neighborIdx);
 
                     double tentative_gScore = current->gScore + move_cost + clearance_cost + turn_cost;
 
@@ -695,6 +725,13 @@ vector<Vector3d> AStarSCA::getPath()
         return vector<Vector3d>();
     }
 
+    // Precompute axial clearance of raw_path nodes to preserve high-clearance corridors during LOS pruning
+    vector<double> raw_clearances(raw_path.size(), 0.0);
+    for (size_t k = 0; k < raw_path.size(); ++k)
+    {
+        raw_clearances[k] = estimateClearance(raw_path[k]);
+    }
+
     vector<Vector3d> pruned_path;
     pruned_path.push_back(raw_path.front());
 
@@ -713,15 +750,17 @@ vector<Vector3d> AStarSCA::getPath()
                 continue;
             }
 
-            Eigen::Vector3i idx1, idx2;
-            if (!Coord2Index(raw_path[current_idx], idx1) ||
-                !Coord2Index(raw_path[next_idx], idx2))
+            double subpath_min_c = raw_clearances[current_idx];
+            for (int k = current_idx + 1; k <= next_idx; ++k)
             {
-                --next_idx;
-                continue;
+                subpath_min_c = std::min(subpath_min_c, raw_clearances[k]);
             }
 
-            if (lineOfSight(idx1, idx2))
+            // Reject shortcuts that cut into the obstacle-hugging 1-voxel layer (< 2*res),
+            // while still allowing smooth pruning when clearance stays >= 2*res.
+            const double res_prune = grid_map_ ? grid_map_->getResolution() : step_size_;
+            const double min_safe_prune_c = std::min(subpath_min_c, 2.0 * res_prune);
+            if (clearancePreservingLineOfSight(raw_path[current_idx], raw_path[next_idx], min_safe_prune_c))
             {
                 found = true;
                 break;
@@ -741,6 +780,7 @@ vector<Vector3d> AStarSCA::getPath()
 
     vector<Vector3d> dense_path;
     dense_path.push_back(pruned_path.front());
+    double final_min_clearance = estimateClearance(pruned_path.front());
 
     const double res = grid_map_ ? grid_map_->getResolution() : step_size_;
     const double dense_step = std::max(0.5 * res, dense_sample_resolution_ratio_ * step_size_);
@@ -765,10 +805,12 @@ vector<Vector3d> AStarSCA::getPath()
                 return raw_path;
             }
 
+            final_min_clearance = std::min(final_min_clearance, estimateClearance(p));
             dense_path.push_back(p);
         }
     }
 
+    last_min_clearance_ = final_min_clearance;
     path_length_ = computePathLength(dense_path);
     return dense_path;
 }

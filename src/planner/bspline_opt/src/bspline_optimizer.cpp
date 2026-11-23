@@ -27,6 +27,7 @@ namespace ego_planner
     nh.param("optimization/guide_validate_resolution_ratio", guide_validate_resolution_ratio_, 0.50);
 
     nh.param("optimization/dynamic_clearance_gain", dynamic_clearance_gain_, 0.25);
+    nh.param("optimization/dynamic_clearance_beta", dynamic_clearance_beta_, 0.40);
     nh.param("optimization/dynamic_clearance_filter_alpha", dynamic_clearance_filter_alpha_, 0.70);
     nh.param("optimization/dynamic_clearance_upper_ratio", dynamic_clearance_upper_ratio_, 1.20);
     nh.param("optimization/dynamic_clearance_lower_ratio", dynamic_clearance_lower_ratio_, 1.00);
@@ -38,6 +39,7 @@ namespace ego_planner
     guide_validate_resolution_ratio_ = clampDouble(guide_validate_resolution_ratio_, 0.25, 1.00);
 
     dynamic_clearance_gain_ = clampDouble(dynamic_clearance_gain_, 0.0, 1.0);
+    dynamic_clearance_beta_ = clampDouble(dynamic_clearance_beta_, 0.05, 1.0);
     dynamic_clearance_filter_alpha_ = clampDouble(dynamic_clearance_filter_alpha_, 0.0, 0.95);
     dynamic_clearance_upper_ratio_ = std::max(1.0, dynamic_clearance_upper_ratio_);
     dynamic_clearance_lower_ratio_ = clampDouble(dynamic_clearance_lower_ratio_, 1.0, dynamic_clearance_upper_ratio_);
@@ -227,12 +229,133 @@ namespace ego_planner
     return true;
   }
 
+  bool BsplineOptimizer::matchGuidePointForControlPoint(const std::vector<Eigen::Vector3d>& guide_path,
+                                                        const Eigen::Vector3d& ctrl_pt,
+                                                        const Eigen::Vector3d& ctrl_pts_law,
+                                                        double progress_ratio,
+                                                        int& last_matched_idx,
+                                                        Eigen::Vector3d& matched_guide_pt) const
+  {
+    const int M = static_cast<int>(guide_path.size());
+    if (M < 2)
+    {
+      return false;
+    }
+
+    const double tau = clampDouble(progress_ratio, 0.0, 1.0);
+
+    // 1. Compute cumulative arc length along guide_path to locate reference progress point
+    std::vector<double> cum_len(M, 0.0);
+    for (int k = 1; k < M; ++k)
+    {
+      cum_len[k] = cum_len[k - 1] + (guide_path[k] - guide_path[k - 1]).norm();
+    }
+    const double total_len = cum_len.back();
+
+    int k_ref = clampDouble(std::round(tau * (M - 1)), 0.0, static_cast<double>(M - 1));
+    Eigen::Vector3d arc_pt = guide_path[k_ref];
+
+    if (total_len > 1e-6)
+    {
+      const double target_s = tau * total_len;
+      auto it = std::lower_bound(cum_len.begin(), cum_len.end(), target_s);
+      int idx_hi = static_cast<int>(std::distance(cum_len.begin(), it));
+      idx_hi = std::max(1, std::min(M - 1, idx_hi));
+      const int idx_lo = idx_hi - 1;
+      const double seg_s = cum_len[idx_hi] - cum_len[idx_lo];
+      const double alpha = (seg_s > 1e-6) ? clampDouble((target_s - cum_len[idx_lo]) / seg_s, 0.0, 1.0) : 0.0;
+      arc_pt = (1.0 - alpha) * guide_path[idx_lo] + alpha * guide_path[idx_hi];
+      k_ref = (alpha < 0.5) ? idx_lo : idx_hi;
+    }
+
+    // 2. Build monotonic local window around last_matched_idx and k_ref
+    const int prev_clamped = std::max(0, std::min(M - 1, last_matched_idx));
+    const int center_idx = std::max(prev_clamped, k_ref);
+    const int win_half = std::max(3, M / 3);
+    const int win_lo = std::max(0, std::min(prev_clamped, k_ref) - 1);
+    const int win_hi = std::min(M - 1, center_idx + win_half);
+
+    // 3. Search within the local window for normal-plane intersection
+    if (ctrl_pts_law.norm() > 1e-6 && win_hi > win_lo)
+    {
+      int best_seg = -1;
+      int best_dist_to_center = M + 1;
+      double best_t = 0.0;
+      Eigen::Vector3d best_plane_pt = arc_pt;
+
+      for (int k = win_lo; k < win_hi; ++k)
+      {
+        const double v0 = (guide_path[k] - ctrl_pt).dot(ctrl_pts_law);
+        const double v1 = (guide_path[k + 1] - ctrl_pt).dot(ctrl_pts_law);
+
+        if (v0 * v1 <= 0.0 && (std::abs(v0) > 0.0 || std::abs(v1) > 0.0))
+        {
+          const Eigen::Vector3d seg_vec = guide_path[k + 1] - guide_path[k];
+          const double denom = ctrl_pts_law.dot(seg_vec);
+          double t = 0.0;
+          Eigen::Vector3d cand_pt = guide_path[k];
+          if (std::abs(denom) > 1e-9)
+          {
+            t = clampDouble(ctrl_pts_law.dot(ctrl_pt - guide_path[k]) / denom, 0.0, 1.0);
+            cand_pt = guide_path[k] + t * seg_vec;
+          }
+
+          const int dist_to_center = std::abs(k - center_idx);
+          if (dist_to_center < best_dist_to_center)
+          {
+            best_dist_to_center = dist_to_center;
+            best_seg = k;
+            best_t = t;
+            best_plane_pt = cand_pt;
+          }
+        }
+      }
+
+      if (best_seg >= 0)
+      {
+        // If the arc-length progress point has a larger clearance offset from ctrl_pt
+        // (e.g., on a strongly curved high-clearance detour), interpolate along the guide polyline
+        // arc-length (never across the Euclidean chord, which could cut inward toward obstacles).
+        const double d_plane = (best_plane_pt - ctrl_pt).norm();
+        const double d_arc = (arc_pt - ctrl_pt).norm();
+        if (d_arc > d_plane * 1.15 && total_len > 1e-6)
+        {
+          const double target_s = tau * total_len;
+          const double plane_s = cum_len[best_seg] + best_t * (cum_len[best_seg + 1] - cum_len[best_seg]);
+          const double mid_s = clampDouble(0.5 * (plane_s + target_s), 0.0, total_len);
+          auto it_mid = std::lower_bound(cum_len.begin(), cum_len.end(), mid_s);
+          int mid_hi = static_cast<int>(std::distance(cum_len.begin(), it_mid));
+          mid_hi = std::max(1, std::min(M - 1, mid_hi));
+          const int mid_lo = mid_hi - 1;
+          const double mid_seg_s = cum_len[mid_hi] - cum_len[mid_lo];
+          const double mid_alpha =
+              (mid_seg_s > 1e-6) ? clampDouble((mid_s - cum_len[mid_lo]) / mid_seg_s, 0.0, 1.0) : 0.0;
+          const Eigen::Vector3d poly_mid_pt =
+              (1.0 - mid_alpha) * guide_path[mid_lo] + mid_alpha * guide_path[mid_hi];
+          matched_guide_pt = ((poly_mid_pt - ctrl_pt).norm() >= d_plane) ? poly_mid_pt : arc_pt;
+        }
+        else
+        {
+          matched_guide_pt = best_plane_pt;
+        }
+        last_matched_idx = std::max(prev_clamped, best_seg);
+        return isFiniteVec(matched_guide_pt);
+      }
+    }
+
+    // 4. Fallback inside window: use monotonic arc-length progress point on the guide path
+    matched_guide_pt = arc_pt;
+    last_matched_idx = center_idx;
+    return isFiniteVec(matched_guide_pt);
+  }
+
   void BsplineOptimizer::resetDynamicClearanceRuntime(int ctrl_pt_num)
   {
     const double base = std::isfinite(cps_.clearance) && cps_.clearance > 1e-6 ? cps_.clearance : dist0_;
     const int n = std::max(0, ctrl_pt_num);
 
     dynamic_clearance_prev_.assign(n, base);
+    dynamic_clearance_has_prev_.assign(n, false);
     dynamic_clearance_count_ = 0;
     dynamic_clearance_fallback_count_ = 0;
     dynamic_clearance_min_ = base;
@@ -289,11 +412,76 @@ namespace ego_planner
     }
   }
 
+  double BsplineOptimizer::estimateGuidePointClearance(const Eigen::Vector3d& guide_pt,
+                                                       const Eigen::Vector3d& push_dir) const
+  {
+    if (!grid_map_ || !isFiniteVec(guide_pt) || !grid_map_->isInMap(guide_pt))
+    {
+      return 0.0;
+    }
+    if (grid_map_->getInflateOccupancy(guide_pt))
+    {
+      return 0.0;
+    }
+
+    const double res = grid_map_->getResolution();
+    static const int dirs[6][3] = {
+        {1, 0, 0}, {-1, 0, 0},
+        {0, 1, 0}, {0, -1, 0},
+        {0, 0, 1}, {0, 0, -1}
+    };
+
+    const bool has_dir = isFiniteVec(push_dir) && push_dir.norm() > 1e-5;
+    const Eigen::Vector3d unit_dir = has_dir ? push_dir.normalized() : Eigen::Vector3d::Zero();
+
+    // Probe the 6 axial directions at guide_pt, excluding axes that point backward
+    // into the source obstacle we are rebounding away from (axis . push_dir < -0.25).
+    // This measures the available clearance in the outward & lateral corridor around guide_pt.
+    constexpr int MAX_AXIAL_STEPS = 3;
+    double c_axis = (MAX_AXIAL_STEPS + 1) * res;
+
+    for (int r = 1; r <= MAX_AXIAL_STEPS; ++r)
+    {
+      const double d = r * res;
+      bool hit = false;
+      for (int i = 0; i < 6; ++i)
+      {
+        const Eigen::Vector3d axis_vec(dirs[i][0], dirs[i][1], dirs[i][2]);
+        if (has_dir && axis_vec.dot(unit_dir) < -0.25)
+        {
+          continue;
+        }
+
+        const Eigen::Vector3d probe_pt = guide_pt + d * axis_vec;
+        if (!grid_map_->isInMap(probe_pt) || grid_map_->getInflateOccupancy(probe_pt))
+        {
+          c_axis = d;
+          hit = true;
+          break;
+        }
+      }
+      if (hit)
+      {
+        break;
+      }
+    }
+
+    return c_axis;
+  }
+
   double BsplineOptimizer::computeLocalClearanceThreshold(double guide_deviation, int ctrl_pt_id)
+  {
+    const double default_clearance = grid_map_ ? 4.0 * grid_map_->getResolution() : 0.40;
+    return computeLocalClearanceThreshold(guide_deviation, default_clearance, ctrl_pt_id);
+  }
+
+  double BsplineOptimizer::computeLocalClearanceThreshold(double guide_deviation,
+                                                          double guide_clearance,
+                                                          int ctrl_pt_id)
   {
     const double base = std::isfinite(cps_.clearance) && cps_.clearance > 1e-6 ? cps_.clearance : dist0_;
 
-    auto fallbackToBase = [&]() -> double
+    auto returnBaseThreshold = [&](bool is_abnormal_fallback) -> double
     {
       const double sf = sanitizeLocalClearance(base);
 
@@ -302,54 +490,72 @@ namespace ego_planner
         dynamic_clearance_prev_[ctrl_pt_id] = sf;
       }
 
-      recordDynamicClearanceStat(sf, true);
+      recordDynamicClearanceStat(sf, is_abnormal_fallback);
       return sf;
     };
 
     if (!enable_dynamic_clearance_)
     {
-      return fallbackToBase();
+      return returnBaseThreshold(false);
     }
 
-    if (!grid_map_ || !std::isfinite(base) || base <= 1e-6)
+    if (!grid_map_ || !std::isfinite(base) || base <= 1e-6 ||
+        !std::isfinite(guide_deviation) || !std::isfinite(guide_clearance) ||
+        ctrl_pt_id < 0 || ctrl_pt_id >= cps_.size)
     {
-      return fallbackToBase();
+      return returnBaseThreshold(true);
     }
 
-    if (!std::isfinite(guide_deviation) || guide_deviation < dynamic_clearance_min_guide_dist_)
-    {
-      return fallbackToBase();
-    }
-
-    if (ctrl_pt_id < 0 || ctrl_pt_id >= cps_.size)
-    {
-      return fallbackToBase();
-    }
-
-    if (static_cast<int>(dynamic_clearance_prev_.size()) != cps_.size)
+    if (static_cast<int>(dynamic_clearance_prev_.size()) != cps_.size ||
+        static_cast<int>(dynamic_clearance_has_prev_.size()) != cps_.size)
     {
       dynamic_clearance_prev_.assign(cps_.size, base);
+      dynamic_clearance_has_prev_.assign(cps_.size, false);
+    }
+
+    // Normal convergence within activation deadzone (d_g < d_min): use baseline s_0 without counting as fallback
+    if (guide_deviation < dynamic_clearance_min_guide_dist_)
+    {
+      return returnBaseThreshold(false);
     }
 
     const double lower = std::max(base, dynamic_clearance_lower_ratio_ * base);
     const double upper_by_ratio = dynamic_clearance_upper_ratio_ * base;
     const double upper_by_global = dynamic_clearance_global_max_ > 1e-6 ? dynamic_clearance_global_max_ : upper_by_ratio;
-    const double cap = std::min(upper_by_ratio, upper_by_global);
+    const double s_u = std::min(upper_by_ratio, upper_by_global);
+
+    // Local clearance-constrained upper bound s_u^g = min(s_u, s_0 + beta * c_g):
+    // When guide_clearance <= 0 (touching inflated obstacle or map boundary), collapse upper bound to lower (s_0).
+    double s_u_g = lower;
+    if (guide_clearance > 1e-6)
+    {
+      s_u_g = std::min(s_u, base + dynamic_clearance_beta_ * guide_clearance);
+    }
+    const double cap = std::max(lower, s_u_g);
 
     if (!std::isfinite(cap) || cap < lower)
     {
-      return fallbackToBase();
+      return returnBaseThreshold(true);
     }
 
-    const double extra_deviation = std::max(0.0, guide_deviation - base);
+    const double extra_deviation = std::max(0.0, guide_deviation - dynamic_clearance_min_guide_dist_);
     const double raw = base + dynamic_clearance_gain_ * extra_deviation;
     const double bounded = clampDouble(raw, lower, cap);
 
-    const double prev = dynamic_clearance_prev_[ctrl_pt_id];
-    const double prev_valid = std::isfinite(prev) && prev > 1e-6 ? prev : base;
-    const double filtered =
-        dynamic_clearance_filter_alpha_ * prev_valid +
-        (1.0 - dynamic_clearance_filter_alpha_) * bounded;
+    double filtered = bounded;
+    if (ctrl_pt_id < static_cast<int>(dynamic_clearance_has_prev_.size()) &&
+        dynamic_clearance_has_prev_[ctrl_pt_id])
+    {
+      const double prev = dynamic_clearance_prev_[ctrl_pt_id];
+      const double prev_valid = std::isfinite(prev) && prev > 1e-6 ? prev : bounded;
+      filtered =
+          dynamic_clearance_filter_alpha_ * prev_valid +
+          (1.0 - dynamic_clearance_filter_alpha_) * bounded;
+    }
+    else if (ctrl_pt_id < static_cast<int>(dynamic_clearance_has_prev_.size()))
+    {
+      dynamic_clearance_has_prev_[ctrl_pt_id] = true;
+    }
 
     const double sf = clampDouble(filtered, lower, cap);
     dynamic_clearance_prev_[ctrl_pt_id] = sf;
@@ -358,8 +564,8 @@ namespace ego_planner
     if (dynamic_clearance_debug_)
     {
       ROS_INFO_THROTTLE(0.5,
-                        "[DynamicSF] cp=%d guide_dev=%.3f base=%.3f raw=%.3f sf=%.3f cap=%.3f",
-                        ctrl_pt_id, guide_deviation, base, raw, sf, cap);
+                        "[DynamicSF] cp=%d d_g=%.3f c_g=%.3f base=%.3f raw=%.3f sf=%.3f s_u_g=%.3f",
+                        ctrl_pt_id, guide_deviation, guide_clearance, base, raw, sf, cap);
     }
 
     return sf;
@@ -556,7 +762,7 @@ namespace ego_planner
               {
                 RichInfoSegs[i].second.base_point[j][0] = base_pt_temp;
                 RichInfoSegs[i].second.direction[j][0] = base_vec_reverse;
-                RichInfoSegs[i].second.local_clearance[j][0] = RichInfoSegs[i].first.local_clearance[j][0];
+                RichInfoSegs[i].second.local_clearance[j][0] = sanitizeLocalClearance(cps_.clearance);
                 break;
               }
             }
@@ -576,6 +782,7 @@ namespace ego_planner
           {
             RichInfoSegs[i].second.base_point[j][0] = base_pt_reverse;
             RichInfoSegs[i].second.direction[j][0] = base_vec_reverse;
+            RichInfoSegs[i].second.local_clearance[j][0] = sanitizeLocalClearance(cps_.clearance);
           }
           else
           {
@@ -598,11 +805,13 @@ namespace ego_planner
           {
             RichInfoSegs[i].second.base_point[j][0] = RichInfoSegs[i].second.base_point[occ_start_id][0];
             RichInfoSegs[i].second.direction[j][0] = RichInfoSegs[i].second.direction[occ_start_id][0];
+            RichInfoSegs[i].second.local_clearance[j][0] = RichInfoSegs[i].second.local_clearance[occ_start_id][0];
           }
           for (int j = occ_end_id + 1; j < RichInfoSegs[i].second.size; j++)
           {
             RichInfoSegs[i].second.base_point[j][0] = RichInfoSegs[i].second.base_point[occ_end_id][0];
             RichInfoSegs[i].second.direction[j][0] = RichInfoSegs[i].second.direction[occ_end_id][0];
+            RichInfoSegs[i].second.local_clearance[j][0] = RichInfoSegs[i].second.local_clearance[occ_end_id][0];
           }
         }
 
@@ -632,6 +841,7 @@ namespace ego_planner
             {
               RichInfoSegs[i].second.base_point[0][0] = base_pt_temp;
               RichInfoSegs[i].second.direction[0][0] = base_vec_reverse;
+              RichInfoSegs[i].second.local_clearance[0][0] = sanitizeLocalClearance(cps_.clearance);
               break;
             }
           }
@@ -649,6 +859,7 @@ namespace ego_planner
         {
           RichInfoSegs[i].second.base_point[0][0] = base_pt_reverse;
           RichInfoSegs[i].second.direction[0][0] = base_vec_reverse;
+          RichInfoSegs[i].second.local_clearance[0][0] = sanitizeLocalClearance(cps_.clearance);
         }
         else
         {
@@ -725,6 +936,7 @@ namespace ego_planner
           cpsOneSample.points.col(cp_id) = cps_.points.col(cp_id);
           cpsOneSample.base_point[cp_id] = cps_.base_point[cp_id];
           cpsOneSample.direction[cp_id] = cps_.direction[cp_id];
+          cpsOneSample.local_clearance[cp_id] = cps_.local_clearance[cp_id];
         }
         else if (cp_id >= segments[seg_id].first && cp_id <= segments[seg_id].second)
         {
@@ -733,7 +945,6 @@ namespace ego_planner
             cpsOneSample.points.col(cp_id) = RichInfoSegs[seg_id].first.points.col(cp_of_seg_id);
             cpsOneSample.base_point[cp_id] = RichInfoSegs[seg_id].first.base_point[cp_of_seg_id];
             cpsOneSample.direction[cp_id] = RichInfoSegs[seg_id].first.direction[cp_of_seg_id];
-            //鏂板
             cpsOneSample.local_clearance[cp_id] = RichInfoSegs[seg_id].first.local_clearance[cp_of_seg_id];
             cp_of_seg_id++;
           }
@@ -744,7 +955,8 @@ namespace ego_planner
               cpsOneSample.points.col(cp_id) = RichInfoSegs[seg_id].second.points.col(cp_of_seg_id);
               cpsOneSample.base_point[cp_id] = RichInfoSegs[seg_id].second.base_point[cp_of_seg_id];
               cpsOneSample.direction[cp_id] = RichInfoSegs[seg_id].second.direction[cp_of_seg_id];
-              cpsOneSample.local_clearance[cp_id] = RichInfoSegs[seg_id].second.local_clearance[cp_of_seg_id];//鏂?              cp_of_seg_id++;
+              cpsOneSample.local_clearance[cp_id] = RichInfoSegs[seg_id].second.local_clearance[cp_of_seg_id];
+              cp_of_seg_id++;
             }
             else
             {
@@ -793,9 +1005,11 @@ namespace ego_planner
       cps_.points = init_points;
       resetDynamicClearanceRuntime(cps_.size);
     }
-    else if (static_cast<int>(dynamic_clearance_prev_.size()) != cps_.size)
+    else
     {
-      resetDynamicClearanceRuntime(cps_.size);
+      const double base = std::isfinite(cps_.clearance) && cps_.clearance > 1e-6 ? cps_.clearance : dist0_;
+      dynamic_clearance_prev_.assign(cps_.size, base);
+      dynamic_clearance_has_prev_.assign(cps_.size, false);
     }
 
     /*** Segment the initial trajectory according to obstacles ***/
@@ -987,40 +1201,17 @@ namespace ego_planner
 
       // step 2
       int got_intersection_id = -1;
+      int last_matched_guide_idx = 0;
+      const double seg_span = std::max(1, segment_ids[i].second - segment_ids[i].first);
       for (int j = segment_ids[i].first + 1; j < segment_ids[i].second; ++j)
       {
         Eigen::Vector3d ctrl_pts_law(init_points.col(j + 1) - init_points.col(j - 1)), intersection_point;
-        int Astar_id = a_star_pathes[i].size() / 2, last_Astar_id; // Let "Astar_id = id_of_the_most_far_away_Astar_point" will be better, but it needs more computation
-        double val = (a_star_pathes[i][Astar_id] - init_points.col(j)).dot(ctrl_pts_law), last_val = val;
-        while (Astar_id >= 0 && Astar_id < (int)a_star_pathes[i].size())
+        const double progress_ratio = static_cast<double>(j - segment_ids[i].first) / seg_span;
+
+        if (matchGuidePointForControlPoint(a_star_pathes[i], init_points.col(j), ctrl_pts_law,
+                                           progress_ratio, last_matched_guide_idx, intersection_point))
         {
-          last_Astar_id = Astar_id;
-
-          if (val >= 0)
-            --Astar_id;
-          else
-            ++Astar_id;
-
-          if (Astar_id < 0 || Astar_id >= (int)a_star_pathes[i].size())
-          {
-            break;
-          }
-
-          val = (a_star_pathes[i][Astar_id] - init_points.col(j)).dot(ctrl_pts_law);
-
-          if (val * last_val <= 0 && (abs(val) > 0 || abs(last_val) > 0)) // val = last_val = 0.0 is not allowed
-          {
-            intersection_point =
-                a_star_pathes[i][Astar_id] +
-                ((a_star_pathes[i][Astar_id] - a_star_pathes[i][last_Astar_id]) *
-                 (ctrl_pts_law.dot(init_points.col(j) - a_star_pathes[i][Astar_id]) / ctrl_pts_law.dot(a_star_pathes[i][Astar_id] - a_star_pathes[i][last_Astar_id])) // = t
-                );
-
-            //cout << "i=" << i << " j=" << j << " Astar_id=" << Astar_id << " last_Astar_id=" << last_Astar_id << " intersection_point = " << intersection_point.transpose() << endl;
-
-            got_intersection_id = j;
-            break;
-          }
+          got_intersection_id = j;
         }
 
         if (got_intersection_id >= 0)
@@ -1051,8 +1242,9 @@ namespace ego_planner
                 cps_.direction[j].push_back(dir);
                 // cout << "A " << j << endl;
 
-                const double guide_deviation = (intersection_point - base_pt).norm();
-                const double sf_local = computeLocalClearanceThreshold(guide_deviation, j);
+                const double guide_deviation = (intersection_point - init_points.col(j)).norm();
+                const double guide_clearance = estimateGuidePointClearance(intersection_point, dir);
+                const double sf_local = computeLocalClearanceThreshold(guide_deviation, guide_clearance, j);
                 cps_.local_clearance[j].push_back(sf_local);
 
                 break;
@@ -1071,54 +1263,32 @@ namespace ego_planner
       {
         Eigen::Vector3d ctrl_pts_law(init_points.col(segment_ids[i].second) - init_points.col(segment_ids[i].first)), intersection_point;
         Eigen::Vector3d middle_point = (init_points.col(segment_ids[i].second) + init_points.col(segment_ids[i].first)) / 2;
-        int Astar_id = a_star_pathes[i].size() / 2, last_Astar_id; // Let "Astar_id = id_of_the_most_far_away_Astar_point" will be better, but it needs more computation
-        double val = (a_star_pathes[i][Astar_id] - middle_point).dot(ctrl_pts_law), last_val = val;
-        while (Astar_id >= 0 && Astar_id < (int)a_star_pathes[i].size())
+        int corner_matched_idx = 0;
+        if (matchGuidePointForControlPoint(a_star_pathes[i], middle_point, ctrl_pts_law,
+                                           0.5, corner_matched_idx, intersection_point))
         {
-          last_Astar_id = Astar_id;
-
-          if (val >= 0)
-            --Astar_id;
-          else
-            ++Astar_id;
-
-          if (Astar_id < 0 || Astar_id >= (int)a_star_pathes[i].size())
+          if ((intersection_point - middle_point).norm() > 0.01) // 1cm.
           {
-            break;
-          }
-
-          val = (a_star_pathes[i][Astar_id] - middle_point).dot(ctrl_pts_law);
-
-          if (val * last_val <= 0 && (abs(val) > 0 || abs(last_val) > 0)) // val = last_val = 0.0 is not allowed
-          {
-            intersection_point =
-                a_star_pathes[i][Astar_id] +
-                ((a_star_pathes[i][Astar_id] - a_star_pathes[i][last_Astar_id]) *
-                 (ctrl_pts_law.dot(middle_point - a_star_pathes[i][Astar_id]) / ctrl_pts_law.dot(a_star_pathes[i][Astar_id] - a_star_pathes[i][last_Astar_id])) // = t
-                );
-
-            if ((intersection_point - middle_point).norm() > 0.01) // 1cm.
+            const int cp_id = segment_ids[i].first;
+            cps_.flag_temp[cp_id] = true;
+            Eigen::Vector3d base_pt = init_points.col(cp_id);
+            Eigen::Vector3d dir = (intersection_point - middle_point).normalized();
+            if (isValidDirectionAndBase(base_pt, dir))
             {
-              const int cp_id = segment_ids[i].first;
-              cps_.flag_temp[cp_id] = true;
-              Eigen::Vector3d base_pt = init_points.col(cp_id);
-              Eigen::Vector3d dir = (intersection_point - middle_point).normalized();
-              if (!isValidDirectionAndBase(base_pt, dir))
-              {
-                ROS_WARN("[BsplineOptimizer] invalid base/direction in initControlPoints corner case, j=%d", cp_id);
-                break;
-              }
               cps_.base_point[cp_id].push_back(base_pt);
               cps_.direction[cp_id].push_back(dir);
 
-              const double guide_deviation = (intersection_point - base_pt).norm();
-              const double sf_local = computeLocalClearanceThreshold(guide_deviation, cp_id);
+              const double guide_deviation = (intersection_point - middle_point).norm();
+              const double guide_clearance = estimateGuidePointClearance(intersection_point, dir);
+              const double sf_local = computeLocalClearanceThreshold(guide_deviation, guide_clearance, cp_id);
               cps_.local_clearance[cp_id].push_back(sf_local);
-
 
               got_intersection_id = cp_id;
             }
-            break;
+            else
+            {
+              ROS_WARN("[BsplineOptimizer] invalid base/direction in initControlPoints corner case, j=%d", cp_id);
+            }
           }
         }
       }
@@ -1765,40 +1935,17 @@ namespace ego_planner
 
         // step 2
         int got_intersection_id = -1;
+        int last_matched_guide_idx = 0;
+        const double seg_span = std::max(1, segment_ids[i].second - segment_ids[i].first);
         for (int j = segment_ids[i].first + 1; j < segment_ids[i].second; ++j)
         {
           Eigen::Vector3d ctrl_pts_law(cps_.points.col(j + 1) - cps_.points.col(j - 1)), intersection_point;
-          int Astar_id = a_star_pathes[i].size() / 2, last_Astar_id; // Let "Astar_id = id_of_the_most_far_away_Astar_point" will be better, but it needs more computation
-          double val = (a_star_pathes[i][Astar_id] - cps_.points.col(j)).dot(ctrl_pts_law), last_val = val;
-          while (Astar_id >= 0 && Astar_id < (int)a_star_pathes[i].size())
+          const double progress_ratio = static_cast<double>(j - segment_ids[i].first) / seg_span;
+
+          if (matchGuidePointForControlPoint(a_star_pathes[i], cps_.points.col(j), ctrl_pts_law,
+                                             progress_ratio, last_matched_guide_idx, intersection_point))
           {
-            last_Astar_id = Astar_id;
-
-            if (val >= 0)
-              --Astar_id;
-            else
-              ++Astar_id;
-
-            if (Astar_id < 0 || Astar_id >= (int)a_star_pathes[i].size())
-            {
-              break;
-            }
-
-            val = (a_star_pathes[i][Astar_id] - cps_.points.col(j)).dot(ctrl_pts_law);
-
-            // cout << val << endl;
-
-            if (val * last_val <= 0 && (abs(val) > 0 || abs(last_val) > 0)) // val = last_val = 0.0 is not allowed
-            {
-              intersection_point =
-                  a_star_pathes[i][Astar_id] +
-                  ((a_star_pathes[i][Astar_id] - a_star_pathes[i][last_Astar_id]) *
-                   (ctrl_pts_law.dot(cps_.points.col(j) - a_star_pathes[i][Astar_id]) / ctrl_pts_law.dot(a_star_pathes[i][Astar_id] - a_star_pathes[i][last_Astar_id])) // = t
-                  );
-
-              got_intersection_id = j;
-              break;
-            }
+            got_intersection_id = j;
           }
 
           if (got_intersection_id >= 0)
@@ -1829,8 +1976,9 @@ namespace ego_planner
                   //cps_.base_point[j].push_back((a / length) * intersection_point + (1 - a / length) * cps_.points.col(j));
                   cps_.direction[j].push_back(dir);
 
-                  const double guide_deviation = (intersection_point - base_pt).norm();
-                  const double sf_local = computeLocalClearanceThreshold(guide_deviation, j);
+                  const double guide_deviation = (intersection_point - cps_.points.col(j)).norm();
+                  const double guide_clearance = estimateGuidePointClearance(intersection_point, dir);
+                  const double sf_local = computeLocalClearanceThreshold(guide_deviation, guide_clearance, j);
                   cps_.local_clearance[j].push_back(sf_local);
 
                   break;
@@ -1891,6 +2039,19 @@ namespace ego_planner
     setBsplineInterval(ts);
 
     cps_ = control_points;
+
+    // Isolate dynamic clearance filter state per candidate topology trajectory
+    const double base = std::isfinite(cps_.clearance) && cps_.clearance > 1e-6 ? cps_.clearance : dist0_;
+    dynamic_clearance_prev_.assign(cps_.size, base);
+    dynamic_clearance_has_prev_.assign(cps_.size, false);
+    for (int j = 0; j < cps_.size && j < static_cast<int>(cps_.local_clearance.size()); ++j)
+    {
+      if (!cps_.local_clearance[j].empty() && std::isfinite(cps_.local_clearance[j].back()))
+      {
+        dynamic_clearance_prev_[j] = cps_.local_clearance[j].back();
+        dynamic_clearance_has_prev_[j] = true;
+      }
+    }
 
     bool flag_success = rebound_optimize(final_cost);
 

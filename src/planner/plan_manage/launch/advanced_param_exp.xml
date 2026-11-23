@@ -165,24 +165,23 @@
     <param name="optimization/max_acc" value="$(arg max_acc)" type="double"/>
     <param name="optimization/enable_guide_path_validation" value="true" type="bool"/>
 
-    <!-- Dynamic safety threshold: default OFF for real-flight safety.
-         Turn it on only after baseline and SCA-A* guide validation are stable. -->
-    <param name="optimization/enable_dynamic_clearance" value="false" type="bool"/>
-
     <param name="optimization/guide_min_points" value="3" type="int"/>
     <param name="optimization/guide_endpoint_tolerance" value="0.30" type="double"/>
     <param name="optimization/guide_validate_resolution_ratio" value="0.50" type="double"/>
 
+    <!-- Dynamic safety threshold: default OFF for real-flight safety.
+         Controlled via $(arg enable_dynamic_clearance). -->
+    <param name="optimization/enable_dynamic_clearance"
+           value="$(arg enable_dynamic_clearance)"
+           type="bool"/>
     <param name="optimization/dynamic_clearance_gain" value="0.25" type="double"/>
+    <param name="optimization/dynamic_clearance_beta" value="0.40" type="double"/>
     <param name="optimization/dynamic_clearance_filter_alpha" value="0.70" type="double"/>
     <param name="optimization/dynamic_clearance_upper_ratio" value="1.20" type="double"/>
     <param name="optimization/dynamic_clearance_lower_ratio" value="1.00" type="double"/>
     <param name="optimization/dynamic_clearance_global_max" value="0.65" type="double"/>
     <param name="optimization/dynamic_clearance_min_guide_dist" value="0.02" type="double"/>
     <!--<param name="optimization/dynamic_clearance_debug" value="false" type="bool"/>-->
-     <param name="optimization/enable_dynamic_clearance"
-           value="$(arg enable_dynamic_clearance)"
-           type="bool"/>
 
     <param name="bspline/limit_vel" value="$(arg max_vel)" type="double"/>
     <param name="bspline/limit_acc" value="$(arg max_acc)" type="double"/>

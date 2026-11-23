@@ -85,6 +85,8 @@
     <node pkg="ego_planner" name="drone_$(arg drone_id)_traj_server" type="traj_server" output="screen">
         <!-- <remap from="position_cmd" to="/setpoints_cmd"/> -->
         <remap from="~planning/bspline" to="drone_$(arg drone_id)_planning/bspline"/>
+        <remap from="~odom_world" to="$(arg odom_topic)"/>
+        <param name="traj_server/drone_id" value="$(arg drone_id)" type="int"/>
         <param name="traj_server/time_forward" value="1.0" type="double"/>
 
         <!-- ===================================================== -->
@@ -114,16 +116,16 @@
 
         <!-- 前视窗口：提前看到急弯，避免当前直道末端过度加速 -->
         <param name="traj_server/enable_lookahead_limit" value="true" type="bool"/>
-        <param name="traj_server/lookahead_time" value="0.60" type="double"/>
-        <param name="traj_server/lookahead_samples" value="6" type="int"/>
+        <param name="traj_server/lookahead_time" value="0.40" type="double"/>
+        <param name="traj_server/lookahead_samples" value="5" type="int"/>
         <param name="traj_server/dynamic_margin" value="0.90" type="double"/>
 
         <!-- 链式求导加速度项：a = P'' alpha^2 + P' alpha_dot
              首次测试可设 false，只启用 alpha_rate_limit；稳定后再设 true -->
         <param name="traj_server/use_alpha_dot_acc" value="false" type="bool"/>
 
-        <!-- tracking error gate：实机建议开启，仿真调试可先关闭 -->
-        <param name="traj_server/enable_tracking_gate" value="false" type="bool"/>
+        <!-- tracking error gate：实机默认开启，防止风扰/跟踪滞后拉脱参考点 -->
+        <param name="traj_server/enable_tracking_gate" value="true" type="bool"/>
         <param name="traj_server/tracking_error_soft" value="0.20" type="double"/>
         <param name="traj_server/tracking_error_hard" value="0.45" type="double"/>
 

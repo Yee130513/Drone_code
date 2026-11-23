@@ -67,6 +67,8 @@ namespace ego_planner
 
     bspline_pub_ = nh.advertise<traj_utils::Bspline>("planning/bspline", 10);
     data_disp_pub_ = nh.advertise<traj_utils::DataDisp>("planning/data_display", 100);
+    string evtr_topic_name = string("/drone_") + std::to_string(planner_manager_->pp_.drone_id) + string("_planning/evtr_state");
+    evtr_state_sub_ = nh.subscribe(evtr_topic_name.c_str(), 10, &EGOReplanFSM::evtrStateCallback, this, ros::TransportHints().tcpNoDelay());
 
     if (target_type_ == TARGET_TYPE::MANUAL_TARGET)
     {
@@ -254,6 +256,37 @@ namespace ego_planner
     odom_orient_.z() = msg->pose.pose.orientation.z;
 
     have_odom_ = true;
+  }
+
+  void EGOReplanFSM::evtrStateCallback(const geometry_msgs::Vector3StampedConstPtr &msg)
+  {
+    if (!std::isfinite(msg->vector.x) || !std::isfinite(msg->vector.y) || !std::isfinite(msg->vector.z))
+      return;
+    evtr_progress_time_ = msg->vector.x;
+    evtr_alpha_ = msg->vector.y;
+    evtr_traj_id_ = static_cast<int>(std::round(msg->vector.z));
+    evtr_state_stamp_ = msg->header.stamp;
+    have_evtr_state_ = true;
+  }
+
+  double EGOReplanFSM::getCurrentTrajProgress(double &exec_alpha) const
+  {
+    const LocalTrajData *info = &planner_manager_->local_data_;
+    const ros::Time now = ros::Time::now();
+    const double t_cur = std::max(0.0, std::min(info->duration_, (now - info->start_time_).toSec()));
+    exec_alpha = 1.0;
+
+    if (have_evtr_state_ && evtr_traj_id_ == info->traj_id_)
+    {
+      const double age = (now - evtr_state_stamp_).toSec();
+      if (age >= -0.02 && age < 0.15 && std::isfinite(evtr_progress_time_) && std::isfinite(evtr_alpha_) && evtr_alpha_ > 0.05)
+      {
+        const double s_est = evtr_progress_time_ + evtr_alpha_ * std::max(0.0, age);
+        exec_alpha = evtr_alpha_;
+        return std::max(0.0, std::min(info->duration_, s_est));
+      }
+    }
+    return t_cur;
   }
 
   void EGOReplanFSM::BroadcastBsplineCallback(const traj_utils::BsplinePtr &msg)
@@ -592,9 +625,8 @@ namespace ego_planner
     {
       /* determine if need to replan */
       LocalTrajData *info = &planner_manager_->local_data_;
-      ros::Time time_now = ros::Time::now();
-      double t_cur = (time_now - info->start_time_).toSec();
-      t_cur = min(info->duration_, t_cur);
+      double exec_alpha = 1.0;
+      double t_cur = getCurrentTrajProgress(exec_alpha);
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
 
@@ -709,14 +741,12 @@ namespace ego_planner
   {
 
     LocalTrajData *info = &planner_manager_->local_data_;
-    ros::Time time_now = ros::Time::now();
-    double t_cur = (time_now - info->start_time_).toSec();
-
-    //cout << "info->velocity_traj_=" << info->velocity_traj_.get_control_points() << endl;
+    double exec_alpha = 1.0;
+    double t_cur = getCurrentTrajProgress(exec_alpha);
 
     start_pt_ = info->position_traj_.evaluateDeBoorT(t_cur);
-    start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
-    start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
+    start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur) * exec_alpha;
+    start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur) * (exec_alpha * exec_alpha);
 
     bool success = callReboundReplan(false, false);
 
@@ -761,7 +791,8 @@ namespace ego_planner
 
     /* ---------- check trajectory ---------- */
     constexpr double time_step = 0.01;
-    double t_cur = (ros::Time::now() - info->start_time_).toSec();
+    double exec_alpha_chk = 1.0;
+    double t_cur = getCurrentTrajProgress(exec_alpha_chk);
     Eigen::Vector3d p_cur = info->position_traj_.evaluateDeBoorT(t_cur);
     const double CLEARANCE = 1.0 * planner_manager_->getSwarmClearance();
     double t_cur_global = ros::Time::now().toSec();

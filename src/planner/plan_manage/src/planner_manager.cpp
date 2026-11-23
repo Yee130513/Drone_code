@@ -284,16 +284,22 @@ namespace ego_planner
              << "Guide_Invalid_Count,"
              << "Init_Collision_Pts,"
              << "Frontend_Failed,"
-             << "Frontend_Fail_Reason\n";
+             << "Frontend_Fail_Reason,"
+             << "Dynamic_Clearance_Enabled,"
+             << "Dynamic_Clearance_Count,"
+             << "Dynamic_Clearance_Fallback_Count,"
+             << "Dynamic_Clearance_Min_m,"
+             << "Dynamic_Clearance_Mean_m,"
+             << "Dynamic_Clearance_Max_m\n";
       }
 
-      int nodes_expanded = -1;
-      double path_length_m = -1.0;
-      double search_time_ms = -1.0;
+      int nodes_expanded = 0;
+      double path_length_m = 0.0;
+      double search_time_ms = 0.0;
       double minimum_clearance_m = -1.0;
-      int segment_recheck_fail_count = -1;
-      int astar_used_fallback = -1;
-      std::string astar_fallback_reason = "NA";
+      int segment_recheck_fail_count = 0;
+      int astar_used_fallback = 0;
+      std::string astar_fallback_reason = "NO_COLLISION";
 
       int opt_iterations = -1;
       int guide_path_count = -1;
@@ -301,6 +307,12 @@ namespace ego_planner
       int init_collision_pts = -1;
       int frontend_failed = -1;
       std::string frontend_fail_reason = "NA";
+      int dyn_clearance_enabled = 0;
+      int dyn_clearance_count = 0;
+      int dyn_clearance_fallback_count = 0;
+      double dyn_clearance_min_m = 0.0;
+      double dyn_clearance_mean_m = 0.0;
+      double dyn_clearance_max_m = 0.0;
 
       if (bspline_optimizer_ != nullptr)
       {
@@ -311,7 +323,14 @@ namespace ego_planner
         frontend_failed = bspline_optimizer_->getLastFrontendFailed() ? 1 : 0;
         frontend_fail_reason = bspline_optimizer_->getLastFrontendFailReason();
 
-        if (bspline_optimizer_->a_star_ != nullptr)
+        dyn_clearance_enabled = bspline_optimizer_->isDynamicClearanceEnabled() ? 1 : 0;
+        dyn_clearance_count = bspline_optimizer_->getDynamicClearanceCount();
+        dyn_clearance_fallback_count = bspline_optimizer_->getDynamicClearanceFallbackCount();
+        dyn_clearance_min_m = bspline_optimizer_->getDynamicClearanceMin();
+        dyn_clearance_mean_m = bspline_optimizer_->getDynamicClearanceMean();
+        dyn_clearance_max_m = bspline_optimizer_->getDynamicClearanceMax();
+
+        if (bspline_optimizer_->a_star_ != nullptr && (guide_path_count > 0 || frontend_failed == 1))
         {
           nodes_expanded = bspline_optimizer_->a_star_->getExpandedNodes();
           path_length_m = bspline_optimizer_->a_star_->getPathLength();
@@ -341,7 +360,13 @@ namespace ego_planner
            << guide_invalid_count << ","
            << init_collision_pts << ","
            << frontend_failed << ","
-           << escape_csv(frontend_fail_reason) << "\n";
+           << escape_csv(frontend_fail_reason) << ","
+           << dyn_clearance_enabled << ","
+           << dyn_clearance_count << ","
+           << dyn_clearance_fallback_count << ","
+           << dyn_clearance_min_m << ","
+           << dyn_clearance_mean_m << ","
+           << dyn_clearance_max_m << "\n";
 
       file.close();
     };
